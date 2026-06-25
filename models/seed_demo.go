@@ -90,7 +90,8 @@ func SeedDemoData(db *DBManager) {
 	var customers []RetailCustomer
 	for i, name := range customerNames {
 		c := RetailCustomer{
-			Code: fmt.Sprintf("C%03d", i+1), Name: name, ShortName: name,
+			Code: fmt.Sprintf("C%03d", i+1), BranchCode: fmt.Sprintf("C%d", i+1),
+			Name: name, ShortName: name,
 			IsVisible: true, TaxRate: 5, TaxMode: 2, Discount: 100, ClosingDate: 26,
 			CreditLimit: 500000, ContactPerson: "店長", Phone1: fmt.Sprintf("02-2700%04d", i+1),
 		}
