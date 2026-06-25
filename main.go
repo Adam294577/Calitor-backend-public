@@ -111,6 +111,10 @@ func App(HttpServer *gin.Engine) {
 		models.SeedPermissionsAndRoles(db)
 		models.SeedDefaultAdmin(db)
 		models.SeedBanks(db)
+		// demo 業務假資料（預設啟用，設 SEED_DEMO=false 可關閉）
+		if os.Getenv("SEED_DEMO") != "false" {
+			models.SeedDemoData(db)
+		}
 	} else {
 		fmt.Println("⏭ 略過資料表遷移與 Seed（設定 RUN_MIGRATE=true 以啟用）")
 	}

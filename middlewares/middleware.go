@@ -34,6 +34,14 @@ func SkipMiddleware(path string) bool {
 func IPWhiteList() gin.HandlerFunc {
 	return func(ctx *gin.Context) {
 		resp := response.New(ctx)
+
+		// demo 模式：跳過 IP 白名單檢查，任何來源都放行
+		// （公開 demo 預設開啟；正式環境務必設 DEMO_MODE=false）
+		if viper.GetBool("DEMO_MODE") {
+			ctx.Next()
+			return
+		}
+
 		snap := firewall.Load()
 
 		// 清單為空：視為未設定，不限制（方便本地開發）

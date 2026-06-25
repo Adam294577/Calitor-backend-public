@@ -49,6 +49,30 @@ go run . dev
 RUN_MIGRATE=true ENV=dev go run .
 ```
 
+## 🚀 Demo 一鍵啟動（給審閱者）
+
+接上你自己的 **PostgreSQL + Redis + MinIO**，即可一鍵建表並灌入假資料，登入操作完整系統：
+
+```bash
+cp .env.example .env          # 填入你的 PG / Redis / MinIO 連線資訊
+# .env 內已預設 DEMO_MODE=true（跳過 IP 白名單）、SEED_DEMO=true（灌 demo 資料）
+# 並把 Server.SeedAdminPassword 設成你想要的 admin 密碼
+
+RUN_MIGRATE=true go run .      # 建表 + seed 帳號/權限 + demo 業務資料
+```
+
+啟動後以前端登入：
+
+- 帳號：`admin`
+- 密碼：你在設定檔填的 `SeedAdminPassword`
+
+即可看到已有資料的商品、客戶、廠商、進銷存單據與營運報表（demo 資料含商品 25、廠商/客戶各 10、進貨 8、銷售 10、訂貨 6，數字自洽）。
+
+> **Demo 開關（正式環境務必關閉）**
+> - `DEMO_MODE=true`：跳過 IP 白名單防火牆，任何來源都能存取。
+> - `SEED_DEMO=true`：`RUN_MIGRATE=true` 時一併灌入 demo 業務假資料（以商品表是否已有資料做冪等，重複啟動不會重灌）。
+> - MinIO 僅商品圖片上傳會用到；demo 商品圖留空，不上傳圖片也能正常瀏覽。
+
 ## 設定載入規則
 
 `config/config_<ENV>.yaml` 由 Viper 依 `ENV` 環境變數或 CLI 第一個參數載入（預設 `prod`）。
