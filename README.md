@@ -53,22 +53,42 @@ RUN_MIGRATE=true ENV=dev go run .
 
 ### 方式 A：用內附 docker-compose 起依賴（最省事，推薦）
 
-`docker-compose.yml` 已備好 PostgreSQL / Redis / MinIO，且 `config_dev.yaml.example` 預設值已對應它：
+`docker-compose.yml` 已備好 PostgreSQL / Redis / MinIO，且 `config_dev.yaml.example` 預設值已對應它。
+
+**macOS / Linux（bash）**
 
 ```bash
-docker compose up -d                                   # 起 PG/Redis/MinIO
+docker compose up -d                                       # 起 PG/Redis/MinIO
 cp config/config_dev.yaml.example config/config_dev.yaml   # 預設值即可直接用
-RUN_MIGRATE=true DEMO_MODE=true go run . dev           # 建表 + seed 帳號/權限 + demo 業務資料
+RUN_MIGRATE=true DEMO_MODE=true go run . dev               # 建表 + seed 帳號/權限 + demo 業務資料
 ```
 
-> 第二次之後啟動（資料已在）：直接 `DEMO_MODE=true go run . dev`（不用再帶 `RUN_MIGRATE`）。
+**Windows（PowerShell）** — 不能用 `VAR=value cmd`，要先 `$env:` 設變數：
+
+```powershell
+docker compose up -d
+Copy-Item config\config_dev.yaml.example config\config_dev.yaml
+$env:RUN_MIGRATE="true"; $env:DEMO_MODE="true"; go run . dev
+```
+
+> 第二次之後啟動（資料已在，不用再建表/灌資料）：
+> - bash：`DEMO_MODE=true go run . dev`
+> - PowerShell：先 `Remove-Item Env:RUN_MIGRATE`（清掉前次設定），再 `$env:DEMO_MODE="true"; go run . dev`
+>
 > 收掉依賴：`docker compose down`（保留資料）或 `docker compose down -v`（連資料一起清）。
 
 ### 方式 B：接你自己的 PG/Redis/MinIO（純環境變數）
 
 ```bash
+# bash
 cp .env.example .env          # 填入你的連線資訊；已預設 DEMO_MODE/SEED_DEMO/admin 密碼
 RUN_MIGRATE=true go run .      # ENV=prod 找不到 yaml 時改用 .env
+```
+
+```powershell
+# PowerShell
+Copy-Item .env.example .env
+$env:RUN_MIGRATE="true"; go run .
 ```
 
 啟動後以前端登入：
