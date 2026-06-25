@@ -12,7 +12,7 @@ Server:
     AllowedOfficeIP: ""                   # IP 白名單，空字串為不限制
   AllowedOrigins:
     - "http://localhost:5207"
-  SeedAdminPassword: "<INIT_ADMIN_PASSWORD>"
+  SeedAdminPassword: "demo1234"    # 首次 RUN_MIGRATE 建立的 admin 密碼
 DataBase:
   Postgres:
     Master:

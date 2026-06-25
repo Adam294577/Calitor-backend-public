@@ -55,16 +55,21 @@ RUN_MIGRATE=true ENV=dev go run .
 
 ```bash
 cp .env.example .env          # 填入你的 PG / Redis / MinIO 連線資訊
-# .env 內已預設 DEMO_MODE=true（跳過 IP 白名單）、SEED_DEMO=true（灌 demo 資料）
-# 並把 Server.SeedAdminPassword 設成你想要的 admin 密碼
+# .env 內已預設：
+#   DEMO_MODE=true            跳過 IP 白名單
+#   SEED_DEMO=true            灌 demo 業務資料
+#   SERVER_SEEDADMINPASSWORD=demo1234   預設 admin 密碼（可自行修改）
 
 RUN_MIGRATE=true go run .      # 建表 + seed 帳號/權限 + demo 業務資料
 ```
 
+> 採用「純環境變數」啟動（不放實體 yaml）：`ENV=prod` 找不到 `config_prod.yaml` 時會改用 `.env`，
+> 所有設定（含 admin 密碼）都從 `.env` 來。若改走 yaml，請 `cp config/config_dev.yaml.example config/config_dev.yaml` 並以 `ENV=dev` 啟動。
+
 啟動後以前端登入：
 
 - 帳號：`admin`
-- 密碼：你在設定檔填的 `SeedAdminPassword`
+- 密碼：`.env` 的 `SERVER_SEEDADMINPASSWORD`（預設 `demo1234`）
 
 即可看到已有資料的商品、客戶、廠商、進銷存單據與營運報表（demo 資料含商品 25、廠商/客戶各 10、進貨 8、銷售 10、訂貨 6，數字自洽）。
 
