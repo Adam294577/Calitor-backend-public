@@ -51,20 +51,25 @@ RUN_MIGRATE=true ENV=dev go run .
 
 ## 🚀 Demo 一鍵啟動（給審閱者）
 
-接上你自己的 **PostgreSQL + Redis + MinIO**，即可一鍵建表並灌入假資料，登入操作完整系統：
+### 方式 A：用內附 docker-compose 起依賴（最省事，推薦）
+
+`docker-compose.yml` 已備好 PostgreSQL / Redis / MinIO，且 `config_dev.yaml.example` 預設值已對應它：
 
 ```bash
-cp .env.example .env          # 填入你的 PG / Redis / MinIO 連線資訊
-# .env 內已預設：
-#   DEMO_MODE=true            跳過 IP 白名單
-#   SEED_DEMO=true            灌 demo 業務資料
-#   SERVER_SEEDADMINPASSWORD=demo1234   預設 admin 密碼（可自行修改）
-
-RUN_MIGRATE=true go run .      # 建表 + seed 帳號/權限 + demo 業務資料
+docker compose up -d                                   # 起 PG/Redis/MinIO
+cp config/config_dev.yaml.example config/config_dev.yaml   # 預設值即可直接用
+RUN_MIGRATE=true DEMO_MODE=true go run . dev           # 建表 + seed 帳號/權限 + demo 業務資料
 ```
 
-> 採用「純環境變數」啟動（不放實體 yaml）：`ENV=prod` 找不到 `config_prod.yaml` 時會改用 `.env`，
-> 所有設定（含 admin 密碼）都從 `.env` 來。若改走 yaml，請 `cp config/config_dev.yaml.example config/config_dev.yaml` 並以 `ENV=dev` 啟動。
+> 第二次之後啟動（資料已在）：直接 `DEMO_MODE=true go run . dev`（不用再帶 `RUN_MIGRATE`）。
+> 收掉依賴：`docker compose down`（保留資料）或 `docker compose down -v`（連資料一起清）。
+
+### 方式 B：接你自己的 PG/Redis/MinIO（純環境變數）
+
+```bash
+cp .env.example .env          # 填入你的連線資訊；已預設 DEMO_MODE/SEED_DEMO/admin 密碼
+RUN_MIGRATE=true go run .      # ENV=prod 找不到 yaml 時改用 .env
+```
 
 啟動後以前端登入：
 

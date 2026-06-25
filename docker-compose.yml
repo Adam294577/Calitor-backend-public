@@ -1,0 +1,61 @@
+# 本機 demo 依賴：PostgreSQL + Redis + MinIO
+# 用法：
+#   docker compose up -d
+#   cp config/config_dev.yaml.example config/config_dev.yaml   # 預設值已對應本檔
+#   RUN_MIGRATE=true DEMO_MODE=true go run . dev
+#
+# 連線資訊（對應 config_dev.yaml.example）：
+#   PostgreSQL  127.0.0.1:55432  calitor / calitorpass / calitor_demo
+#   Redis       127.0.0.1:56379  密碼 redispass
+#   MinIO       127.0.0.1:59000  minioadmin / minioadmin123（主控台 :59001，bucket=calitor）
+services:
+  postgres:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_USER: calitor
+      POSTGRES_PASSWORD: calitorpass
+      POSTGRES_DB: calitor_demo
+    ports:
+      - "55432:5432"
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U calitor -d calitor_demo"]
+      interval: 3s
+      timeout: 3s
+      retries: 20
+
+  redis:
+    image: redis:7-alpine
+    command: ["redis-server", "--requirepass", "redispass"]
+    ports:
+      - "56379:6379"
+
+  minio:
+    image: minio/minio:latest
+    command: ["server", "/data", "--console-address", ":9001"]
+    environment:
+      MINIO_ROOT_USER: minioadmin
+      MINIO_ROOT_PASSWORD: minioadmin123
+    ports:
+      - "59000:9000"
+      - "59001:9001"
+    volumes:
+      - miniodata:/data
+
+  # 一次性建立 demo 用 bucket（商品圖片上傳才會用到；不上傳圖也能正常瀏覽）
+  createbucket:
+    image: minio/mc:latest
+    depends_on:
+      - minio
+    entrypoint: >
+      /bin/sh -c "
+      until /usr/bin/mc alias set local http://minio:9000 minioadmin minioadmin123; do sleep 1; done;
+      /usr/bin/mc mb -p local/calitor || true;
+      /usr/bin/mc anonymous set download local/calitor || true;
+      exit 0;
+      "
+
+volumes:
+  pgdata:
+  miniodata:

@@ -1,46 +1,42 @@
-# 複製本檔為 config_dev.yaml 並填入實際值（config_dev.yaml 已被 .gitignore，不會入版控）
+# 複製本檔為 config_dev.yaml 即可（預設值已對應 docker-compose.yml，本機可直接用）
+# config_dev.yaml 已被 .gitignore，不會入版控
 Server:
   Website:
-    Port: 8003
+    Port: 8002
   Logs:
     FilePath: "storage/logs"
     FileName: "access"
-  JwtKey: "<YOUR_BASE64_JWT_KEY>"
+  JwtKey: "dGVzdGp3dGtleS1jaGFuZ2VtZQ=="    # demo 用，正式環境請換掉
   Security:
-    BcryptCost: 1                         # 開發環境用低成本加速登入
-    AllowedOfficeIP: ""
+    BcryptCost: 4                            # 開發/demo 用低成本加速登入
+    AllowedOfficeIP: ""                      # 空=不限制；本機 demo 不需設
   AllowedOrigins:
+    - "http://localhost:5173"
     - "http://localhost:5207"
-    - "http://localhost:5208"
-  SeedAdminPassword: "demo1234"    # 首次 RUN_MIGRATE 建立的 admin 密碼
+  SeedAdminPassword: "demo1234"              # 首次 RUN_MIGRATE 建立的 admin 密碼
 DataBase:
   Postgres:
     Master:
-      HostName: "<DB_HOST>"
-      UserName: "<DB_USER>"
-      Password: "<DB_PASSWORD>"
-      DbName: "<DB_NAME>"
-      Port: 5432
+      HostName: "127.0.0.1"
+      UserName: "calitor"
+      Password: "calitorpass"
+      DbName: "calitor_demo"
+      Port: 55432
     Slave:
-      HostName: "<DB_HOST>"
-      UserName: "<DB_USER>"
-      Password: "<DB_PASSWORD>"
-      DbName: "<DB_NAME>"
-      Port: 5432
+      HostName: "127.0.0.1"
+      UserName: "calitor"
+      Password: "calitorpass"
+      DbName: "calitor_demo"
+      Port: 55432
 Redis:
-  Host: "<REDIS_HOST>"
-  Port: 6379
-  Password: "<REDIS_PASSWORD>"
+  Host: "127.0.0.1"
+  Port: 56379
+  Password: "redispass"
   Db: 0
   PoolSize: 20
-Oauth:
-  Line:
-    ChannelId: ""
-    ChannelSecret: ""
-    CallbackURL: ""
 Minio:
-  Endpoint: "<MINIO_ENDPOINT>"
-  AccessKey: "<MINIO_ACCESS_KEY>"
-  SecretKey: "<MINIO_SECRET_KEY>"
-  Bucket: "<MINIO_BUCKET>"
-  UseSSL: true
+  Endpoint: "127.0.0.1:59000"
+  AccessKey: "minioadmin"
+  SecretKey: "minioadmin123"
+  Bucket: "calitor"
+  UseSSL: false
