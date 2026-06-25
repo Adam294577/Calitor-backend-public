@@ -1,0 +1,46 @@
+# 複製本檔為 config_dev.yaml 並填入實際值（config_dev.yaml 已被 .gitignore，不會入版控）
+Server:
+  Website:
+    Port: 8003
+  Logs:
+    FilePath: "storage/logs"
+    FileName: "access"
+  JwtKey: "<YOUR_BASE64_JWT_KEY>"
+  Security:
+    BcryptCost: 1                         # 開發環境用低成本加速登入
+    AllowedOfficeIP: ""
+  AllowedOrigins:
+    - "http://localhost:5207"
+    - "http://localhost:5208"
+  SeedAdminPassword: "<INIT_ADMIN_PASSWORD>"
+DataBase:
+  Postgres:
+    Master:
+      HostName: "<DB_HOST>"
+      UserName: "<DB_USER>"
+      Password: "<DB_PASSWORD>"
+      DbName: "<DB_NAME>"
+      Port: 5432
+    Slave:
+      HostName: "<DB_HOST>"
+      UserName: "<DB_USER>"
+      Password: "<DB_PASSWORD>"
+      DbName: "<DB_NAME>"
+      Port: 5432
+Redis:
+  Host: "<REDIS_HOST>"
+  Port: 6379
+  Password: "<REDIS_PASSWORD>"
+  Db: 0
+  PoolSize: 20
+Oauth:
+  Line:
+    ChannelId: ""
+    ChannelSecret: ""
+    CallbackURL: ""
+Minio:
+  Endpoint: "<MINIO_ENDPOINT>"
+  AccessKey: "<MINIO_ACCESS_KEY>"
+  SecretKey: "<MINIO_SECRET_KEY>"
+  Bucket: "<MINIO_BUCKET>"
+  UseSSL: true

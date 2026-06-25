@@ -1,0 +1,46 @@
+# 複製本檔為 config_prod.yaml 並填入實際值（config_prod.yaml 已被 .gitignore，不會入版控）
+# 亦可改用環境變數覆蓋（將 key 的點號換成底線，如 Redis.Host → REDIS_HOST）
+Server:
+  Website:
+    Port: 8002
+  Logs:
+    FilePath: "storage/logs"
+    FileName: "access"
+  JwtKey: "<YOUR_BASE64_JWT_KEY>"        # 例：openssl rand -base64 16
+  Security:
+    BcryptCost: 12                        # 正式環境建議 10~12
+    AllowedOfficeIP: ""                   # IP 白名單，空字串為不限制
+  AllowedOrigins:
+    - "http://localhost:5207"
+  SeedAdminPassword: "<INIT_ADMIN_PASSWORD>"
+DataBase:
+  Postgres:
+    Master:
+      HostName: "<DB_HOST>"
+      UserName: "<DB_USER>"
+      Password: "<DB_PASSWORD>"
+      DbName: "<DB_NAME>"
+      Port: 5432
+    Slave:
+      HostName: "<DB_HOST>"
+      UserName: "<DB_USER>"
+      Password: "<DB_PASSWORD>"
+      DbName: "<DB_NAME>"
+      Port: 5432
+Redis:
+  Host: "<REDIS_HOST>"
+  Port: 6379
+  Password: "<REDIS_PASSWORD>"
+  Db: 0
+  PoolSize: 20
+Oauth:
+  Line:
+    ChannelId: ""
+    ChannelSecret: ""
+    CallbackURL: ""
+Minio:
+  Endpoint: "<MINIO_ENDPOINT>"
+  AccessKey: "<MINIO_ACCESS_KEY>"
+  SecretKey: "<MINIO_SECRET_KEY>"
+  Bucket: "<MINIO_BUCKET>"
+  UseSSL: true

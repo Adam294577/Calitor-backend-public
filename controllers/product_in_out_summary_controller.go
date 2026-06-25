@@ -1,0 +1,995 @@
+package controllers
+
+import (
+	"fmt"
+	"project/models"
+	response "project/services/responses"
+	"sort"
+	"strconv"
+	"strings"
+
+	"github.com/gin-gonic/gin"
+)
+
+// productSummaryRow 商品列表（Tab 1：商品型號）
+type productSummaryRow struct {
+	ID            int64  `json:"id" gorm:"column:id"`
+	ModelCode     string `json:"model_code" gorm:"column:model_code"`
+	NameSpec      string `json:"name_spec" gorm:"column:name_spec"`
+	VendorCode    string `json:"vendor_code" gorm:"column:vendor_code"`
+	VendorName    string `json:"vendor_name" gorm:"column:vendor_name"`
+	CreatedOn     string `json:"created_on" gorm:"column:created_on"`
+	SizeGroupID   int64  `json:"size_group_id" gorm:"column:size_group_id"`
+	SizeGroupCode string `json:"size_group_code" gorm:"column:size_group_code"`
+}
+
+// detailRow 進出明細列（Tab 2：商品進出明細）
+type detailRow struct {
+	Kind         string         `json:"kind"`
+	KindLabel    string         `json:"kind_label"`
+	DocNo        string         `json:"doc_no"`
+	BranchCode   string         `json:"branch_code"`
+	BranchName   string         `json:"branch_name"`
+	Sizes        map[string]int `json:"sizes"`
+	TotalQty     int            `json:"total_qty"`
+	UnitPrice    float64        `json:"unit_price"`
+	VendorCode   string         `json:"vendor_code"`
+	VendorName   string         `json:"vendor_name"`
+	DocDate      string         `json:"doc_date"`
+	ModifiedDate string         `json:"modified_date"`
+	ModifiedBy   string         `json:"modified_by"`
+	// IsReturn 標示此列屬退貨(stock_mode=2 / shipment_mode=4 / sell_mode=2)。
+	// 退貨列 SQL 端已把 qty 改為 -ABS,前端僅靠這個 flag 套用淡紅色樣式與「(退)」標籤。
+	IsReturn bool `json:"is_return"`
+}
+
+type sizeColumn struct {
+	ID        int64  `json:"id"`
+	Label     string `json:"label"`
+	SortOrder int    `json:"sort_order"`
+}
+
+// GetProductInOutSummaryProducts Tab 1：依過濾條件列出商品（預設只列 is_visible=true）
+func GetProductInOutSummaryProducts(c *gin.Context) {
+	resp := response.New(c)
+	db := models.PostgresNew()
+	defer db.Close()
+
+	where := "WHERE p.deleted_at IS NULL AND p.is_visible = true"
+	args := []interface{}{}
+
+	if frag, fargs := BuildModelCodeRangeWhere("p.model_code", c.Query("model_code_from"), c.Query("model_code_to")); frag != "" {
+		where += " AND " + frag
+		args = append(args, fargs...)
+	}
+	// 商品品牌區間(product_brands.code) — 與既有 brand_ids(對帳品牌)分屬不同體系
+	brandCodeFrom := strings.TrimSpace(c.Query("brand_code_from"))
+	brandCodeTo := strings.TrimSpace(c.Query("brand_code_to"))
+	if frag, fargs := BuildModelCodeRangeWhere("pb.code", brandCodeFrom, brandCodeTo); frag != "" {
+		where += " AND " + frag
+		args = append(args, fargs...)
+	}
+	if v := c.Query("brand_ids"); v != "" {
+		ids := splitNonEmpty(v)
+		if len(ids) > 0 {
+			where += " AND p.brand_id IN (" + placeholders(len(ids)) + ")"
+			for _, id := range ids {
+				args = append(args, id)
+			}
+		}
+	}
+	if v := c.Query("name_spec"); v != "" {
+		where += " AND p.name_spec ILIKE ?"
+		args = append(args, "%"+v+"%")
+	}
+	if v := c.Query("vendor_id"); v != "" {
+		where += " AND p.id IN (SELECT pv2.product_id FROM product_vendors pv2 WHERE pv2.vendor_id = ?)"
+		args = append(args, v)
+	}
+	if v := c.Query("size_group_code"); v != "" {
+		where += " AND sg.code = ?"
+		args = append(args, v)
+	}
+	if v := c.Query("created_on"); v != "" {
+		where += " AND TO_CHAR(p.created_on, 'YYYYMMDD') = ?"
+		args = append(args, v)
+	}
+	if v := c.Query("created_on_from"); v != "" {
+		where += " AND TO_CHAR(p.created_on, 'YYYYMMDD') >= ?"
+		args = append(args, v)
+	}
+	if v := c.Query("created_on_to"); v != "" {
+		where += " AND TO_CHAR(p.created_on, 'YYYYMMDD') <= ?"
+		args = append(args, v)
+	}
+
+	// 異動範圍過濾:只列符合所選 kinds 至少一種異動的商品。
+	// 若同時帶 date_from / date_to,再依業務日期限縮(與 Tab 2 明細查詢條件一致)。
+	dateFrom := c.Query("date_from")
+	dateTo := c.Query("date_to")
+	kinds := splitNonEmpty(c.Query("kinds"))
+	customerIDs := splitNonEmpty(c.Query("customer_ids"))
+	// 只選了客戶但沒勾任何 kind 時,以全部 8 種 kinds 跑 EXISTS,確保客戶條件仍能套用
+	if len(customerIDs) > 0 && len(kinds) == 0 {
+		kinds = []string{"stock", "shipment", "retail_sell", "modify", "transfer_in", "transfer_out", "order", "purchase", "inventory"}
+	}
+	if len(kinds) > 0 {
+		// 每種 kind 對應的 (header table, item table, header 業務日期欄, 客戶欄位)
+		// 客戶欄位:大多在 header (xh.customer_id);transfer_in 在 item table (xi.dest_customer_id);
+		// transfer_out 在 header (xh.source_customer_id)。
+		kindMap := map[string][4]string{
+			"stock":        {"stocks", "stock_items", "stock_date", "xh.customer_id"},
+			"shipment":     {"shipments", "shipment_items", "shipment_date", "xh.customer_id"},
+			"retail_sell":  {"retail_sells", "retail_sell_items", "sell_date", "xh.customer_id"},
+			"modify":       {"modifies", "modify_items", "modify_date", "xh.customer_id"},
+			"transfer_in":  {"transfers", "transfer_items", "transfer_date", "xi.dest_customer_id"},
+			"transfer_out": {"transfers", "transfer_items", "transfer_date", "xh.source_customer_id"},
+			"order":        {"orders", "order_items", "order_date", "xh.customer_id"},
+			"purchase":     {"purchases", "purchase_items", "purchase_date", "xh.customer_id"},
+		}
+		// item table 的 FK 欄位
+		fkMap := map[string]string{
+			"stocks":       "stock_id",
+			"shipments":    "shipment_id",
+			"retail_sells": "retail_sell_id",
+			"modifies":     "modify_id",
+			"transfers":    "transfer_id",
+			"orders":       "order_id",
+			"purchases":    "purchase_id",
+		}
+		// 同 header+item+customerCol 視為同一個 EXISTS;transfer_in / transfer_out 因客戶欄位不同會各自獨立。
+		seen := map[string]bool{}
+		exists := []string{}
+		for _, k := range kinds {
+			cfg, ok := kindMap[k]
+			if !ok {
+				continue
+			}
+			key := cfg[0] + "|" + cfg[1] + "|" + cfg[3]
+			if seen[key] {
+				continue
+			}
+			seen[key] = true
+			header, item, dateCol, customerCol := cfg[0], cfg[1], cfg[2], cfg[3]
+			fk := fkMap[header]
+
+			dateParts := []string{}
+			if dateFrom != "" {
+				dateParts = append(dateParts, fmt.Sprintf("xh.%s >= ?", dateCol))
+				args = append(args, dateFrom)
+			}
+			if dateTo != "" {
+				dateParts = append(dateParts, fmt.Sprintf("xh.%s <= ?", dateCol))
+				args = append(args, dateTo)
+			}
+			extra := ""
+			if len(dateParts) > 0 {
+				extra += " AND " + strings.Join(dateParts, " AND ")
+			}
+			if len(customerIDs) > 0 {
+				extra += " AND " + customerCol + " IN (" + placeholders(len(customerIDs)) + ")"
+				for _, id := range customerIDs {
+					args = append(args, id)
+				}
+			}
+
+			exists = append(exists, fmt.Sprintf(
+				"EXISTS (SELECT 1 FROM %s xi JOIN %s xh ON xh.id = xi.%s AND xh.deleted_at IS NULL WHERE xi.product_id = p.id%s)",
+				item, header, fk, extra,
+			))
+		}
+		// 庫存：當前 product_size_stocks 有非 0 qty(忽略日期，仍套用客戶過濾)
+		hasInventory := false
+		for _, k := range kinds {
+			if k == "inventory" {
+				hasInventory = true
+				break
+			}
+		}
+		if hasInventory {
+			// 已隱藏客戶(is_visible = false)視同軟刪除,庫存不應計入 — 與 inventory_controller 同一規則
+			invExists := "EXISTS (SELECT 1 FROM product_size_stocks pss JOIN retail_customers rc ON rc.id = pss.customer_id AND rc.is_visible = true WHERE pss.product_id = p.id AND pss.qty != 0"
+			if len(customerIDs) > 0 {
+				invExists += " AND pss.customer_id IN (" + placeholders(len(customerIDs)) + ")"
+				for _, id := range customerIDs {
+					args = append(args, id)
+				}
+			}
+			invExists += ")"
+			exists = append(exists, invExists)
+		}
+		if len(exists) > 0 {
+			where += " AND (" + strings.Join(exists, " OR ") + ")"
+		}
+	}
+
+	// 條件式 JOIN product_brands:只有當品牌區間有值時才 JOIN,避免拖慢預設查詢
+	extraJoin := ""
+	if brandCodeFrom != "" || brandCodeTo != "" {
+		extraJoin = "LEFT JOIN product_brands pb ON pb.id = p.product_brand_id"
+	}
+
+	sql := fmt.Sprintf(`
+SELECT
+  p.id,
+  p.model_code,
+  COALESCE(p.name_spec, '') AS name_spec,
+  COALESCE(v.code, '') AS vendor_code,
+  COALESCE(NULLIF(v.short_name, ''), v.name, '') AS vendor_name,
+  COALESCE(TO_CHAR(p.created_on, 'YYYYMMDD'), '') AS created_on,
+  COALESCE(sg.id, 0) AS size_group_id,
+  COALESCE(sg.code, '') AS size_group_code
+FROM products p
+LEFT JOIN size_groups sg ON sg.id = p.size1_group_id
+LEFT JOIN product_vendors pv ON pv.product_id = p.id AND pv.is_primary = true
+LEFT JOIN vendors v ON v.id = pv.vendor_id
+%s
+%s
+ORDER BY %s
+`, extraJoin, where, ModelCodeOrderBy("p.model_code"))
+
+	var rows []productSummaryRow
+	if err := db.GetRead().Raw(sql, args...).Scan(&rows).Error; err != nil {
+		resp.Panic(err).Send()
+		return
+	}
+
+	resp.Success("查詢成功").SetData(rows).Send()
+}
+
+// GetProductInOutSummaryDetail Tab 2：取單一商品的進出明細
+// 依 kinds 動態組合 UNION，從 stocks/shipments/retail_sells/modifies/transfers/orders/purchases 彙總
+func GetProductInOutSummaryDetail(c *gin.Context) {
+	resp := response.New(c)
+	db := models.PostgresNew()
+	defer db.Close()
+
+	productID := c.Query("product_id")
+	if productID == "" {
+		resp.Fail(400, "缺少 product_id").Send()
+		return
+	}
+
+	// 取得商品 size group 以決定欄位順序
+	var sizeGroupID int64
+	if err := db.GetRead().Raw(
+		"SELECT COALESCE(size1_group_id, 0) FROM products WHERE id = ? AND deleted_at IS NULL",
+		productID,
+	).Scan(&sizeGroupID).Error; err != nil {
+		resp.Panic(err).Send()
+		return
+	}
+
+	// 取得 size options（用於決定欄位顯示順序）
+	var sizeCols []sizeColumn
+	if sizeGroupID > 0 {
+		var options []models.SizeOption
+		db.GetRead().Where("size_group_id = ?", sizeGroupID).
+			Order("sort_order ASC, id ASC").Find(&options)
+		for _, o := range options {
+			sizeCols = append(sizeCols, sizeColumn{ID: o.ID, Label: o.Label, SortOrder: o.SortOrder})
+		}
+	}
+	if sizeCols == nil {
+		sizeCols = []sizeColumn{}
+	}
+
+	// 過濾條件
+	branchCodes := splitNonEmpty(c.Query("branch_codes"))
+	branchIDs := splitNonEmpty(c.Query("branch_ids"))
+	txDateFrom := c.Query("tx_date_from")
+	txDateTo := c.Query("tx_date_to")
+	kinds := splitNonEmpty(c.Query("kinds"))
+	if len(kinds) == 0 {
+		// 預設全部
+		kinds = []string{"stock", "shipment", "retail_sell", "modify", "transfer_in", "transfer_out", "order", "purchase", "inventory"}
+	}
+	kindSet := map[string]bool{}
+	for _, k := range kinds {
+		kindSet[k] = true
+	}
+
+	// 將 branch_ids 轉成 branch_codes（部分異動單以 branch_code 字串記錄分店）
+	if len(branchIDs) > 0 {
+		var codes []string
+		db.GetRead().Raw(
+			"SELECT DISTINCT branch_code FROM retail_customers WHERE id IN ? AND branch_code <> ''",
+			branchIDs,
+		).Scan(&codes)
+		branchCodes = append(branchCodes, codes...)
+	}
+
+	allRows := []detailRow{}
+
+	if kindSet["stock"] {
+		rows, err := queryStockRows(db, productID, branchIDs, txDateFrom, txDateTo)
+		if err != nil {
+			resp.Panic(err).Send()
+			return
+		}
+		allRows = append(allRows, rows...)
+	}
+	if kindSet["shipment"] {
+		rows, err := queryShipmentRows(db, productID, branchCodes, branchIDs, txDateFrom, txDateTo)
+		if err != nil {
+			resp.Panic(err).Send()
+			return
+		}
+		allRows = append(allRows, rows...)
+	}
+	if kindSet["retail_sell"] {
+		rows, err := queryRetailSellRows(db, productID, branchCodes, branchIDs, txDateFrom, txDateTo)
+		if err != nil {
+			resp.Panic(err).Send()
+			return
+		}
+		allRows = append(allRows, rows...)
+	}
+	if kindSet["modify"] {
+		rows, err := queryModifyRows(db, productID, branchCodes, branchIDs, txDateFrom, txDateTo)
+		if err != nil {
+			resp.Panic(err).Send()
+			return
+		}
+		allRows = append(allRows, rows...)
+	}
+	if kindSet["transfer_out"] {
+		rows, err := queryTransferOutRows(db, productID, branchCodes, branchIDs, txDateFrom, txDateTo)
+		if err != nil {
+			resp.Panic(err).Send()
+			return
+		}
+		allRows = append(allRows, rows...)
+	}
+	if kindSet["transfer_in"] {
+		rows, err := queryTransferInRows(db, productID, branchCodes, branchIDs, txDateFrom, txDateTo)
+		if err != nil {
+			resp.Panic(err).Send()
+			return
+		}
+		allRows = append(allRows, rows...)
+	}
+	if kindSet["order"] {
+		rows, err := queryOrderRows(db, productID, branchCodes, branchIDs, txDateFrom, txDateTo)
+		if err != nil {
+			resp.Panic(err).Send()
+			return
+		}
+		allRows = append(allRows, rows...)
+	}
+	if kindSet["purchase"] {
+		rows, err := queryPurchaseRows(db, productID, branchIDs, txDateFrom, txDateTo)
+		if err != nil {
+			resp.Panic(err).Send()
+			return
+		}
+		allRows = append(allRows, rows...)
+	}
+	if kindSet["inventory"] {
+		rows, err := queryInventoryRows(db, productID, branchIDs)
+		if err != nil {
+			resp.Panic(err).Send()
+			return
+		}
+		allRows = append(allRows, rows...)
+	}
+
+	// 依 kind 排序順序：進貨 → 出貨 → 銷貨 → 調整 → 調出 → 調入 → 訂貨 → 採購 → 庫存
+	kindOrder := map[string]int{
+		"stock": 1, "shipment": 2, "retail_sell": 3, "modify": 4,
+		"transfer_out": 5, "transfer_in": 6, "order": 7, "purchase": 8, "inventory": 9,
+	}
+	sort.SliceStable(allRows, func(i, j int) bool {
+		ki := kindOrder[allRows[i].Kind]
+		kj := kindOrder[allRows[j].Kind]
+		if ki != kj {
+			return ki < kj
+		}
+		if allRows[i].Kind == "inventory" {
+			return allRows[i].BranchCode < allRows[j].BranchCode
+		}
+		if allRows[i].DocDate != allRows[j].DocDate {
+			return allRows[i].DocDate < allRows[j].DocDate
+		}
+		return allRows[i].DocNo < allRows[j].DocNo
+	})
+
+	resp.Success("查詢成功").SetData(map[string]interface{}{
+		"rows":         allRows,
+		"size_columns": sizeCols,
+	}).Send()
+}
+
+// ========== 各 kind 的查詢函式 ==========
+
+type rawSizeRow struct {
+	HeaderID     int64   `gorm:"column:header_id"`
+	DocNo        string  `gorm:"column:doc_no"`
+	DocDate      string  `gorm:"column:doc_date"`
+	BranchCode   string  `gorm:"column:branch_code"`
+	BranchName   string  `gorm:"column:branch_name"`
+	UnitPrice    float64 `gorm:"column:unit_price"`
+	VendorCode   string  `gorm:"column:vendor_code"`
+	VendorName   string  `gorm:"column:vendor_name"`
+	UpdatedAt    string  `gorm:"column:updated_at"`
+	ModifiedBy   string  `gorm:"column:modified_by"`
+	SizeOptionID int64   `gorm:"column:size_option_id"`
+	Qty          int     `gorm:"column:qty"`
+	IsReturn     bool    `gorm:"column:is_return"`
+}
+
+func aggregateBySizes(raws []rawSizeRow, kind, kindLabel string) []detailRow {
+	type aggKey = int64
+	bucket := map[aggKey]*detailRow{}
+	order := []aggKey{}
+	for _, r := range raws {
+		dr, exists := bucket[r.HeaderID]
+		if !exists {
+			dr = &detailRow{
+				Kind:         kind,
+				KindLabel:    kindLabel,
+				DocNo:        r.DocNo,
+				BranchCode:   r.BranchCode,
+				BranchName:   r.BranchName,
+				Sizes:        map[string]int{},
+				UnitPrice:    r.UnitPrice,
+				VendorCode:   r.VendorCode,
+				VendorName:   r.VendorName,
+				DocDate:      r.DocDate,
+				ModifiedDate: r.UpdatedAt,
+				ModifiedBy:   r.ModifiedBy,
+				IsReturn:     r.IsReturn,
+			}
+			bucket[r.HeaderID] = dr
+			order = append(order, r.HeaderID)
+		}
+		if r.SizeOptionID > 0 {
+			key := strconv.FormatInt(r.SizeOptionID, 10)
+			dr.Sizes[key] += r.Qty
+			dr.TotalQty += r.Qty
+		}
+	}
+	rows := make([]detailRow, 0, len(order))
+	for _, k := range order {
+		rows = append(rows, *bucket[k])
+	}
+	return rows
+}
+
+func queryStockRows(db *models.DBManager, productID string, branchIDs []string, dateFrom, dateTo string) ([]detailRow, error) {
+	where := "WHERE s.deleted_at IS NULL AND si.product_id = ?"
+	args := []interface{}{productID}
+	if len(branchIDs) > 0 {
+		where += " AND s.customer_id IN (" + placeholders(len(branchIDs)) + ")"
+		for _, id := range branchIDs {
+			args = append(args, id)
+		}
+	}
+	if dateFrom != "" {
+		where += " AND s.stock_date >= ?"
+		args = append(args, dateFrom)
+	}
+	if dateTo != "" {
+		where += " AND s.stock_date <= ?"
+		args = append(args, dateTo)
+	}
+
+	sql := fmt.Sprintf(`
+SELECT
+  s.id AS header_id,
+  s.stock_no AS doc_no,
+  s.stock_date AS doc_date,
+  COALESCE(rc.branch_code, '') AS branch_code,
+  COALESCE(NULLIF(rc.short_name, ''), rc.name, '') AS branch_name,
+  COALESCE(si.purchase_price, 0) AS unit_price,
+  COALESCE(v.code, '') AS vendor_code,
+  COALESCE(NULLIF(v.short_name, ''), v.name, '') AS vendor_name,
+  TO_CHAR(s.updated_at AT TIME ZONE 'Asia/Taipei', 'YYYYMMDD') AS updated_at,
+  COALESCE(a.account, '') AS modified_by,
+  COALESCE(sis.size_option_id, 0) AS size_option_id,
+  COALESCE(CASE WHEN s.stock_mode = 2 THEN -ABS(sis.qty) ELSE sis.qty END, 0) AS qty,
+  (s.stock_mode = 2) AS is_return
+FROM stocks s
+JOIN stock_items si ON si.stock_id = s.id
+LEFT JOIN stock_item_sizes sis ON sis.stock_item_id = si.id
+LEFT JOIN retail_customers rc ON rc.id = s.customer_id
+LEFT JOIN vendors v ON v.id = s.vendor_id
+LEFT JOIN admins a ON a.id = s.recorder_id
+%s
+ORDER BY s.stock_date, s.id
+`, where)
+
+	var raws []rawSizeRow
+	if err := db.GetRead().Raw(sql, args...).Scan(&raws).Error; err != nil {
+		return nil, err
+	}
+	return aggregateBySizes(raws, "stock", "進貨"), nil
+}
+
+func queryShipmentRows(db *models.DBManager, productID string, branchCodes, branchIDs []string, dateFrom, dateTo string) ([]detailRow, error) {
+	where := "WHERE s.deleted_at IS NULL AND si.product_id = ?"
+	args := []interface{}{productID}
+	if len(branchCodes) > 0 || len(branchIDs) > 0 {
+		conds := []string{}
+		if len(branchCodes) > 0 {
+			conds = append(conds, "s.ship_store IN ("+placeholders(len(branchCodes))+")")
+			for _, c := range branchCodes {
+				args = append(args, c)
+			}
+		}
+		if len(branchIDs) > 0 {
+			conds = append(conds, "s.customer_id IN ("+placeholders(len(branchIDs))+")")
+			for _, id := range branchIDs {
+				args = append(args, id)
+			}
+		}
+		where += " AND (" + strings.Join(conds, " OR ") + ")"
+	}
+	if dateFrom != "" {
+		where += " AND s.shipment_date >= ?"
+		args = append(args, dateFrom)
+	}
+	if dateTo != "" {
+		where += " AND s.shipment_date <= ?"
+		args = append(args, dateTo)
+	}
+
+	sql := fmt.Sprintf(`
+SELECT
+  s.id AS header_id,
+  s.shipment_no AS doc_no,
+  s.shipment_date AS doc_date,
+  COALESCE(s.ship_store, '') AS branch_code,
+  COALESCE(NULLIF(branch.short_name, ''), branch.name, '') AS branch_name,
+  COALESCE(si.ship_price, 0) AS unit_price,
+  COALESCE(rc.code, '') AS vendor_code,
+  COALESCE(NULLIF(rc.short_name, ''), rc.name, '') AS vendor_name,
+  TO_CHAR(s.updated_at AT TIME ZONE 'Asia/Taipei', 'YYYYMMDD') AS updated_at,
+  COALESCE(a.account, '') AS modified_by,
+  COALESCE(sis.size_option_id, 0) AS size_option_id,
+  COALESCE(CASE WHEN s.shipment_mode = 4 THEN -ABS(sis.qty) ELSE sis.qty END, 0) AS qty,
+  (s.shipment_mode = 4) AS is_return
+FROM shipments s
+JOIN shipment_items si ON si.shipment_id = s.id
+LEFT JOIN shipment_item_sizes sis ON sis.shipment_item_id = si.id
+LEFT JOIN LATERAL (
+  SELECT short_name, name FROM retail_customers
+  WHERE branch_code = s.ship_store AND deleted_at IS NULL LIMIT 1
+) branch ON TRUE
+LEFT JOIN retail_customers rc ON rc.id = s.customer_id
+LEFT JOIN admins a ON a.id = s.recorder_id
+%s
+ORDER BY s.shipment_date, s.id
+`, where)
+
+	var raws []rawSizeRow
+	if err := db.GetRead().Raw(sql, args...).Scan(&raws).Error; err != nil {
+		return nil, err
+	}
+	return aggregateBySizes(raws, "shipment", "出貨"), nil
+}
+
+func queryRetailSellRows(db *models.DBManager, productID string, branchCodes, branchIDs []string, dateFrom, dateTo string) ([]detailRow, error) {
+	where := "WHERE s.deleted_at IS NULL AND si.product_id = ?"
+	args := []interface{}{productID}
+	if len(branchCodes) > 0 || len(branchIDs) > 0 {
+		conds := []string{}
+		if len(branchCodes) > 0 {
+			conds = append(conds, "s.sell_store IN ("+placeholders(len(branchCodes))+")")
+			for _, c := range branchCodes {
+				args = append(args, c)
+			}
+		}
+		if len(branchIDs) > 0 {
+			conds = append(conds, "s.customer_id IN ("+placeholders(len(branchIDs))+")")
+			for _, id := range branchIDs {
+				args = append(args, id)
+			}
+		}
+		where += " AND (" + strings.Join(conds, " OR ") + ")"
+	}
+	if dateFrom != "" {
+		where += " AND s.sell_date >= ?"
+		args = append(args, dateFrom)
+	}
+	if dateTo != "" {
+		where += " AND s.sell_date <= ?"
+		args = append(args, dateTo)
+	}
+
+	// header_id 以 si.id 分桶:同一張零售單可能含多筆同商品(銷貨+退貨 mix),
+	// 用 s.id 會被 aggregateBySizes 合併成一列,丟失 sell_mode 差異與 unit_price 正負號。
+	sql := fmt.Sprintf(`
+SELECT
+  si.id AS header_id,
+  s.sell_no AS doc_no,
+  s.sell_date AS doc_date,
+  COALESCE(s.sell_store, '') AS branch_code,
+  COALESCE(NULLIF(branch.short_name, ''), branch.name, '') AS branch_name,
+  CASE WHEN si.sell_mode = 2 THEN -1 ELSE 1 END
+    * (COALESCE(si.cash_amount, 0) + COALESCE(si.card_amount, 0)) AS unit_price,
+  '' AS vendor_code,
+  COALESCE(NULLIF(rc.short_name, ''), rc.name, '') AS vendor_name,
+  TO_CHAR(s.updated_at AT TIME ZONE 'Asia/Taipei', 'YYYYMMDD') AS updated_at,
+  COALESCE(a.account, '') AS modified_by,
+  COALESCE(sis.size_option_id, 0) AS size_option_id,
+  COALESCE(CASE WHEN si.sell_mode = 2 THEN -ABS(sis.qty) ELSE sis.qty END, 0) AS qty,
+  (si.sell_mode = 2) AS is_return
+FROM retail_sells s
+JOIN retail_sell_items si ON si.retail_sell_id = s.id
+LEFT JOIN retail_sell_item_sizes sis ON sis.retail_sell_item_id = si.id
+LEFT JOIN retail_customers branch ON branch.code = s.sell_store AND branch.deleted_at IS NULL
+LEFT JOIN retail_customers rc ON rc.id = s.customer_id
+LEFT JOIN admins a ON a.id = s.recorder_id
+%s
+ORDER BY s.sell_date, s.id, si.id
+`, where)
+
+	var raws []rawSizeRow
+	if err := db.GetRead().Raw(sql, args...).Scan(&raws).Error; err != nil {
+		return nil, err
+	}
+	return aggregateBySizes(raws, "retail_sell", "銷貨"), nil
+}
+
+func queryModifyRows(db *models.DBManager, productID string, branchCodes, branchIDs []string, dateFrom, dateTo string) ([]detailRow, error) {
+	where := "WHERE m.deleted_at IS NULL AND mi.product_id = ?"
+	args := []interface{}{productID}
+	if len(branchCodes) > 0 || len(branchIDs) > 0 {
+		conds := []string{}
+		if len(branchCodes) > 0 {
+			conds = append(conds, "m.modify_store IN ("+placeholders(len(branchCodes))+")")
+			for _, c := range branchCodes {
+				args = append(args, c)
+			}
+		}
+		if len(branchIDs) > 0 {
+			conds = append(conds, "m.customer_id IN ("+placeholders(len(branchIDs))+")")
+			for _, id := range branchIDs {
+				args = append(args, id)
+			}
+		}
+		where += " AND (" + strings.Join(conds, " OR ") + ")"
+	}
+	if dateFrom != "" {
+		where += " AND m.modify_date >= ?"
+		args = append(args, dateFrom)
+	}
+	if dateTo != "" {
+		where += " AND m.modify_date <= ?"
+		args = append(args, dateTo)
+	}
+
+	sql := fmt.Sprintf(`
+SELECT
+  m.id AS header_id,
+  m.modify_no AS doc_no,
+  m.modify_date AS doc_date,
+  COALESCE(m.modify_store, '') AS branch_code,
+  COALESCE(NULLIF(branch.short_name, ''), branch.name, '') AS branch_name,
+  0 AS unit_price,
+  '' AS vendor_code,
+  COALESCE(NULLIF(rc.short_name, ''), rc.name, '') AS vendor_name,
+  TO_CHAR(m.updated_at AT TIME ZONE 'Asia/Taipei', 'YYYYMMDD') AS updated_at,
+  COALESCE(a.account, '') AS modified_by,
+  COALESCE(mis.size_option_id, 0) AS size_option_id,
+  COALESCE(mis.qty, 0) AS qty
+FROM modifies m
+JOIN modify_items mi ON mi.modify_id = m.id
+LEFT JOIN modify_item_sizes mis ON mis.modify_item_id = mi.id
+LEFT JOIN LATERAL (
+  SELECT short_name, name FROM retail_customers
+  WHERE branch_code = m.modify_store AND deleted_at IS NULL LIMIT 1
+) branch ON TRUE
+LEFT JOIN retail_customers rc ON rc.id = m.customer_id
+LEFT JOIN admins a ON a.id = m.recorder_id
+%s
+ORDER BY m.modify_date, m.id
+`, where)
+
+	var raws []rawSizeRow
+	if err := db.GetRead().Raw(sql, args...).Scan(&raws).Error; err != nil {
+		return nil, err
+	}
+	return aggregateBySizes(raws, "modify", "調整"), nil
+}
+
+func queryTransferOutRows(db *models.DBManager, productID string, branchCodes, branchIDs []string, dateFrom, dateTo string) ([]detailRow, error) {
+	where := "WHERE t.deleted_at IS NULL AND ti.product_id = ?"
+	args := []interface{}{productID}
+	if len(branchCodes) > 0 || len(branchIDs) > 0 {
+		conds := []string{}
+		if len(branchCodes) > 0 {
+			conds = append(conds, "t.source_store IN ("+placeholders(len(branchCodes))+")")
+			for _, c := range branchCodes {
+				args = append(args, c)
+			}
+		}
+		if len(branchIDs) > 0 {
+			conds = append(conds, "t.source_customer_id IN ("+placeholders(len(branchIDs))+")")
+			for _, id := range branchIDs {
+				args = append(args, id)
+			}
+		}
+		where += " AND (" + strings.Join(conds, " OR ") + ")"
+	}
+	if dateFrom != "" {
+		where += " AND t.transfer_date >= ?"
+		args = append(args, dateFrom)
+	}
+	if dateTo != "" {
+		where += " AND t.transfer_date <= ?"
+		args = append(args, dateTo)
+	}
+
+	// 調出：以 transfer_item 為單位（單筆 transfer 可能有不同 dest）
+	sql := fmt.Sprintf(`
+SELECT
+  ti.id AS header_id,
+  t.transfer_no AS doc_no,
+  t.transfer_date AS doc_date,
+  COALESCE(t.source_store, '') AS branch_code,
+  COALESCE(NULLIF(branch.short_name, ''), branch.name, '') AS branch_name,
+  COALESCE(ti.unit_price, 0) AS unit_price,
+  '' AS vendor_code,
+  COALESCE(NULLIF(dest.short_name, ''), dest.name, '') AS vendor_name,
+  TO_CHAR(t.updated_at AT TIME ZONE 'Asia/Taipei', 'YYYYMMDD') AS updated_at,
+  COALESCE(a.account, '') AS modified_by,
+  COALESCE(tis.size_option_id, 0) AS size_option_id,
+  COALESCE(tis.qty, 0) AS qty
+FROM transfers t
+JOIN transfer_items ti ON ti.transfer_id = t.id
+LEFT JOIN transfer_item_sizes tis ON tis.transfer_item_id = ti.id
+LEFT JOIN LATERAL (
+  SELECT short_name, name FROM retail_customers
+  WHERE branch_code = t.source_store AND deleted_at IS NULL LIMIT 1
+) branch ON TRUE
+LEFT JOIN LATERAL (
+  SELECT short_name, name FROM retail_customers
+  WHERE branch_code = ti.dest_store AND deleted_at IS NULL LIMIT 1
+) dest ON TRUE
+LEFT JOIN admins a ON a.id = t.recorder_id
+%s
+ORDER BY t.transfer_date, ti.id
+`, where)
+
+	var raws []rawSizeRow
+	if err := db.GetRead().Raw(sql, args...).Scan(&raws).Error; err != nil {
+		return nil, err
+	}
+	return aggregateBySizes(raws, "transfer_out", "調出"), nil
+}
+
+func queryTransferInRows(db *models.DBManager, productID string, branchCodes, branchIDs []string, dateFrom, dateTo string) ([]detailRow, error) {
+	where := "WHERE t.deleted_at IS NULL AND ti.product_id = ?"
+	args := []interface{}{productID}
+	if len(branchCodes) > 0 || len(branchIDs) > 0 {
+		conds := []string{}
+		if len(branchCodes) > 0 {
+			conds = append(conds, "ti.dest_store IN ("+placeholders(len(branchCodes))+")")
+			for _, c := range branchCodes {
+				args = append(args, c)
+			}
+		}
+		if len(branchIDs) > 0 {
+			conds = append(conds, "ti.dest_customer_id IN ("+placeholders(len(branchIDs))+")")
+			for _, id := range branchIDs {
+				args = append(args, id)
+			}
+		}
+		where += " AND (" + strings.Join(conds, " OR ") + ")"
+	}
+	if dateFrom != "" {
+		where += " AND t.transfer_date >= ?"
+		args = append(args, dateFrom)
+	}
+	if dateTo != "" {
+		where += " AND t.transfer_date <= ?"
+		args = append(args, dateTo)
+	}
+
+	// 調入：以 transfer_item 為單位（每筆 item 可能有不同 dest）
+	sql := fmt.Sprintf(`
+SELECT
+  ti.id AS header_id,
+  t.transfer_no AS doc_no,
+  t.transfer_date AS doc_date,
+  COALESCE(ti.dest_store, '') AS branch_code,
+  COALESCE(NULLIF(branch.short_name, ''), branch.name, '') AS branch_name,
+  COALESCE(ti.unit_price, 0) AS unit_price,
+  '' AS vendor_code,
+  COALESCE(NULLIF(src.short_name, ''), src.name, '') AS vendor_name,
+  TO_CHAR(t.updated_at AT TIME ZONE 'Asia/Taipei', 'YYYYMMDD') AS updated_at,
+  COALESCE(a.account, '') AS modified_by,
+  COALESCE(tis.size_option_id, 0) AS size_option_id,
+  COALESCE(tis.qty, 0) AS qty
+FROM transfers t
+JOIN transfer_items ti ON ti.transfer_id = t.id
+LEFT JOIN transfer_item_sizes tis ON tis.transfer_item_id = ti.id
+LEFT JOIN LATERAL (
+  SELECT short_name, name FROM retail_customers
+  WHERE branch_code = ti.dest_store AND deleted_at IS NULL LIMIT 1
+) branch ON TRUE
+LEFT JOIN LATERAL (
+  SELECT short_name, name FROM retail_customers
+  WHERE branch_code = t.source_store AND deleted_at IS NULL LIMIT 1
+) src ON TRUE
+LEFT JOIN admins a ON a.id = t.recorder_id
+%s
+ORDER BY t.transfer_date, ti.id
+`, where)
+
+	var raws []rawSizeRow
+	if err := db.GetRead().Raw(sql, args...).Scan(&raws).Error; err != nil {
+		return nil, err
+	}
+	return aggregateBySizes(raws, "transfer_in", "調入"), nil
+}
+
+func queryOrderRows(db *models.DBManager, productID string, branchCodes, branchIDs []string, dateFrom, dateTo string) ([]detailRow, error) {
+	where := "WHERE o.deleted_at IS NULL AND oi.product_id = ?"
+	args := []interface{}{productID}
+	if len(branchCodes) > 0 || len(branchIDs) > 0 {
+		conds := []string{}
+		if len(branchCodes) > 0 {
+			conds = append(conds, "o.order_store IN ("+placeholders(len(branchCodes))+")")
+			for _, c := range branchCodes {
+				args = append(args, c)
+			}
+		}
+		if len(branchIDs) > 0 {
+			conds = append(conds, "o.customer_id IN ("+placeholders(len(branchIDs))+")")
+			for _, id := range branchIDs {
+				args = append(args, id)
+			}
+		}
+		where += " AND (" + strings.Join(conds, " OR ") + ")"
+	}
+	if dateFrom != "" {
+		where += " AND o.order_date >= ?"
+		args = append(args, dateFrom)
+	}
+	if dateTo != "" {
+		where += " AND o.order_date <= ?"
+		args = append(args, dateTo)
+	}
+
+	sql := fmt.Sprintf(`
+SELECT
+  o.id AS header_id,
+  o.order_no AS doc_no,
+  o.order_date AS doc_date,
+  COALESCE(o.order_store, '') AS branch_code,
+  COALESCE(NULLIF(branch.short_name, ''), branch.name, '') AS branch_name,
+  COALESCE(oi.order_price, 0) AS unit_price,
+  COALESCE(rc.code, '') AS vendor_code,
+  COALESCE(NULLIF(rc.short_name, ''), rc.name, '') AS vendor_name,
+  TO_CHAR(o.updated_at AT TIME ZONE 'Asia/Taipei', 'YYYYMMDD') AS updated_at,
+  COALESCE(a.account, '') AS modified_by,
+  COALESCE(ois.size_option_id, 0) AS size_option_id,
+  COALESCE(ois.qty, 0) AS qty
+FROM orders o
+JOIN order_items oi ON oi.order_id = o.id
+LEFT JOIN order_item_sizes ois ON ois.order_item_id = oi.id
+LEFT JOIN LATERAL (
+  SELECT short_name, name FROM retail_customers
+  WHERE branch_code = o.order_store AND deleted_at IS NULL LIMIT 1
+) branch ON TRUE
+LEFT JOIN retail_customers rc ON rc.id = o.customer_id
+LEFT JOIN admins a ON a.id = o.recorder_id
+%s
+ORDER BY o.order_date, o.id
+`, where)
+
+	var raws []rawSizeRow
+	if err := db.GetRead().Raw(sql, args...).Scan(&raws).Error; err != nil {
+		return nil, err
+	}
+	return aggregateBySizes(raws, "order", "訂貨"), nil
+}
+
+func queryPurchaseRows(db *models.DBManager, productID string, branchIDs []string, dateFrom, dateTo string) ([]detailRow, error) {
+	where := "WHERE p.deleted_at IS NULL AND pi.product_id = ?"
+	args := []interface{}{productID}
+	if len(branchIDs) > 0 {
+		where += " AND p.customer_id IN (" + placeholders(len(branchIDs)) + ")"
+		for _, id := range branchIDs {
+			args = append(args, id)
+		}
+	}
+	if dateFrom != "" {
+		where += " AND p.purchase_date >= ?"
+		args = append(args, dateFrom)
+	}
+	if dateTo != "" {
+		where += " AND p.purchase_date <= ?"
+		args = append(args, dateTo)
+	}
+
+	sql := fmt.Sprintf(`
+SELECT
+  p.id AS header_id,
+  p.purchase_no AS doc_no,
+  p.purchase_date AS doc_date,
+  COALESCE(rc.branch_code, '') AS branch_code,
+  COALESCE(NULLIF(rc.short_name, ''), rc.name, '') AS branch_name,
+  COALESCE(pi.purchase_price, 0) AS unit_price,
+  COALESCE(v.code, '') AS vendor_code,
+  COALESCE(NULLIF(v.short_name, ''), v.name, '') AS vendor_name,
+  TO_CHAR(p.updated_at AT TIME ZONE 'Asia/Taipei', 'YYYYMMDD') AS updated_at,
+  COALESCE(a.account, '') AS modified_by,
+  COALESCE(pis.size_option_id, 0) AS size_option_id,
+  COALESCE(pis.qty, 0) AS qty
+FROM purchases p
+JOIN purchase_items pi ON pi.purchase_id = p.id
+LEFT JOIN purchase_item_sizes pis ON pis.purchase_item_id = pi.id
+LEFT JOIN retail_customers rc ON rc.id = p.customer_id
+LEFT JOIN vendors v ON v.id = p.vendor_id
+LEFT JOIN admins a ON a.id = p.recorder_id
+%s
+ORDER BY p.purchase_date, p.id
+`, where)
+
+	var raws []rawSizeRow
+	if err := db.GetRead().Raw(sql, args...).Scan(&raws).Error; err != nil {
+		return nil, err
+	}
+	return aggregateBySizes(raws, "purchase", "採購"), nil
+}
+
+// queryInventoryRows 庫存：依 product_size_stocks 當前快照，每庫點彙整成一列。
+// 不套用日期區間（庫存是即時值）；branch_ids 仍生效。
+// 透過將 customer_id 塞入 rawSizeRow.HeaderID 作為分桶 key，重用 aggregateBySizes 取得「一庫點一列」。
+func queryInventoryRows(db *models.DBManager, productID string, branchIDs []string) ([]detailRow, error) {
+	// rc.is_visible = true:已隱藏客戶視同軟刪除,庫存不列出
+	where := "WHERE p.deleted_at IS NULL AND rc.is_visible = true AND pss.qty != 0 AND pss.product_id = ?"
+	args := []interface{}{productID}
+	if len(branchIDs) > 0 {
+		where += " AND pss.customer_id IN (" + placeholders(len(branchIDs)) + ")"
+		for _, id := range branchIDs {
+			args = append(args, id)
+		}
+	}
+
+	sql := fmt.Sprintf(`
+SELECT
+  pss.customer_id AS header_id,
+  '' AS doc_no,
+  '' AS doc_date,
+  COALESCE(rc.branch_code, '') AS branch_code,
+  COALESCE(NULLIF(rc.short_name, ''), rc.name, '') AS branch_name,
+  0 AS unit_price,
+  '' AS vendor_code,
+  '' AS vendor_name,
+  '' AS updated_at,
+  '' AS modified_by,
+  pss.size_option_id AS size_option_id,
+  pss.qty AS qty
+FROM product_size_stocks pss
+JOIN products p ON p.id = pss.product_id
+LEFT JOIN retail_customers rc ON rc.id = pss.customer_id
+%s
+ORDER BY rc.branch_code, pss.size_option_id
+`, where)
+
+	var raws []rawSizeRow
+	if err := db.GetRead().Raw(sql, args...).Scan(&raws).Error; err != nil {
+		return nil, err
+	}
+	return aggregateBySizes(raws, "inventory", "庫存"), nil
+}
+
+// splitNonEmpty 拆分逗號分隔字串，去掉空字串
+func splitNonEmpty(s string) []string {
+	if s == "" {
+		return nil
+	}
+	parts := strings.Split(s, ",")
+	out := make([]string, 0, len(parts))
+	for _, p := range parts {
+		if t := strings.TrimSpace(p); t != "" {
+			out = append(out, t)
+		}
+	}
+	return out
+}

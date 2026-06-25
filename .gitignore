@@ -1,0 +1,22 @@
+# AI Editor
+.cursor
+.specify
+specs
+# 執行檔
+landtop.exe
+# logs
+/storage
+# windows local development 臨時檔案
+tmp/
+tmp-dev/
+tmp-prod/
+build-errors.log
+dev/
+# 本地 air 配置(dev/prod 環境分開,不入版控)
+.air.dev.toml
+.air.prod.toml
+# 真實設定檔不入版控，僅保留 *.example 範本
+config/*.yaml
+.env
+.env.*
+!.env.example

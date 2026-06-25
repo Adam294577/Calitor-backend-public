@@ -1,0 +1,274 @@
+package controllers
+
+import (
+	"fmt"
+	"project/models"
+	response "project/services/responses"
+	"strconv"
+	"strings"
+
+	"github.com/gin-gonic/gin"
+)
+
+// inventoryRow 庫存明細列
+type inventoryRow struct {
+	ProductID         int64              `json:"product_id"`
+	ModelCode         string             `json:"model_code"`
+	NameSpec          string             `json:"name_spec"`
+	CustomerID        int64              `json:"customer_id"`
+	CustomerShortName string             `json:"customer_short_name"`
+	SizeGroupID       int64              `json:"size_group_id"`
+	SizeGroupCode     string             `json:"size_group_code"`
+	CostStart         float64            `json:"cost_start"`
+	TotalQty          int                `json:"total_qty"`
+	WholesaleTaxIncl  float64            `json:"wholesale_tax_incl"` // 批價(含稅,直接抓商品建檔值)
+	MSRP              float64            `json:"msrp"`
+	CreatedOn         string             `json:"created_on"`
+	Sizes             map[string]int     `json:"sizes"`
+	SizeOptions       []inventorySizeCol `json:"size_options"`
+}
+
+type inventorySizeCol struct {
+	ID        int64  `json:"id"`
+	Label     string `json:"label"`
+	SortOrder int    `json:"sort_order"`
+}
+
+// inventoryRawRow raw query 結果
+type inventoryRawRow struct {
+	ProductID         int64   `gorm:"column:product_id"`
+	ModelCode         string  `gorm:"column:model_code"`
+	NameSpec          string  `gorm:"column:name_spec"`
+	CustomerID        int64   `gorm:"column:customer_id"`
+	CustomerShortName string  `gorm:"column:customer_short_name"`
+	SizeGroupID       int64   `gorm:"column:size_group_id"`
+	SizeGroupCode     string  `gorm:"column:size_group_code"`
+	CostStart         float64 `gorm:"column:cost_start"`
+	WholesaleTaxIncl  float64 `gorm:"column:wholesale_tax_incl"`
+	MSRP              float64 `gorm:"column:msrp"`
+	CreatedOn         string  `gorm:"column:created_on"`
+	SizeOptionID      int64   `gorm:"column:size_option_id"`
+	SizeLabel         string  `gorm:"column:size_label"`
+	SortOrder         int     `gorm:"column:sort_order"`
+	Qty               int     `gorm:"column:qty"`
+}
+
+// GetInventory 庫存明細查詢
+func GetInventory(c *gin.Context) {
+	resp := response.New(c)
+	db := models.PostgresNew()
+	defer db.Close()
+
+	// 組建 WHERE 條件(直接使用 product_size_stocks 別名 pss,進貨加/出貨扣皆已即時更新)
+	// p.is_visible = true 排除被公司決定下架的商品(如 remove.md 列出的清單)
+	// rc.is_visible = true:過濾掉「不顯示」的客戶/庫點(等價軟刪除)
+	where := "WHERE p.deleted_at IS NULL AND p.is_visible = true AND rc.is_visible = true"
+	args := []interface{}{}
+
+	if v := c.Query("customer_ids"); v != "" {
+		ids := strings.Split(v, ",")
+		where += " AND pss.customer_id IN (" + placeholders(len(ids)) + ")"
+		for _, id := range ids {
+			args = append(args, strings.TrimSpace(id))
+		}
+	}
+	if frag, fargs := BuildModelCodeRangeWhere("p.model_code", c.Query("model_code_from"), c.Query("model_code_to")); frag != "" {
+		where += " AND " + frag
+		args = append(args, fargs...)
+	}
+	if v := c.Query("brand_ids"); v != "" {
+		ids := strings.Split(v, ",")
+		where += " AND p.product_brand_id IN (" + placeholders(len(ids)) + ")"
+		for _, id := range ids {
+			args = append(args, strings.TrimSpace(id))
+		}
+	}
+	if v := c.Query("reconciliation_brand_ids"); v != "" {
+		ids := strings.Split(v, ",")
+		where += " AND p.brand_id IN (" + placeholders(len(ids)) + ")"
+		for _, id := range ids {
+			args = append(args, strings.TrimSpace(id))
+		}
+	}
+	if v := c.Query("vendor_ids"); v != "" {
+		ids := strings.Split(v, ",")
+		where += " AND p.id IN (SELECT pv2.product_id FROM product_vendors pv2 WHERE pv2.vendor_id IN (" + placeholders(len(ids)) + "))"
+		for _, id := range ids {
+			args = append(args, strings.TrimSpace(id))
+		}
+	}
+	if v := c.Query("created_from"); v != "" {
+		where += " AND TO_CHAR(p.created_on, 'YYYYMMDD') >= ?"
+		args = append(args, v)
+	}
+	if v := c.Query("created_to"); v != "" {
+		where += " AND TO_CHAR(p.created_on, 'YYYYMMDD') <= ?"
+		args = append(args, v)
+	}
+	for i := 1; i <= 5; i++ {
+		key := fmt.Sprintf("category%d_id", i)
+		if v := c.Query(key); v != "" {
+			col := fmt.Sprintf("category%d_id", i)
+			where += fmt.Sprintf(" AND p.id IN (SELECT pcm.product_id FROM product_category_map pcm WHERE pcm.category_type = %d AND pcm.%s = ?)", i, col)
+			args = append(args, v)
+		}
+	}
+
+	// 成本 = 該商品最新一筆進貨單(stock_mode=1, total_qty>0)的進價,與「客戶出貨統計」對齊。
+	// 批價 = 商品建檔含稅價 (products.wholesale_tax_incl)
+	sql := fmt.Sprintf(`
+SELECT
+  pss.product_id,
+  p.model_code,
+  COALESCE(p.name_spec, '') as name_spec,
+  pss.customer_id,
+  COALESCE(NULLIF(rc.short_name, ''), rc.name, '') as customer_short_name,
+  COALESCE(sg.id, 0) as size_group_id,
+  COALESCE(sg.code, '') as size_group_code,
+  COALESCE(latest_cost.purchase_price, 0) as cost_start,
+  COALESCE(p.wholesale_tax_incl, 0) as wholesale_tax_incl,
+  COALESCE(p.msrp, 0) as msrp,
+  COALESCE(TO_CHAR(p.created_on, 'YYYYMMDD'), '') as created_on,
+  pss.size_option_id,
+  so.label as size_label,
+  so.sort_order,
+  pss.qty
+FROM product_size_stocks pss
+JOIN products p ON p.id = pss.product_id
+JOIN size_options so ON so.id = pss.size_option_id AND so.size_group_id = p.size1_group_id
+LEFT JOIN size_groups sg ON sg.id = p.size1_group_id
+LEFT JOIN LATERAL (
+  SELECT si2.purchase_price
+  FROM stock_items si2
+  JOIN stocks s2 ON s2.id = si2.stock_id
+    AND s2.deleted_at IS NULL
+    AND s2.stock_mode = 1
+  WHERE si2.product_id = p.id
+    AND si2.total_qty > 0
+  ORDER BY s2.stock_date DESC, si2.id DESC
+  LIMIT 1
+) latest_cost ON TRUE
+LEFT JOIN retail_customers rc ON rc.id = pss.customer_id
+LEFT JOIN product_brands pb ON pb.id = p.product_brand_id
+%s AND pss.qty != 0
+ORDER BY %s, pss.customer_id, so.sort_order
+`, where, ModelCodeOrderBy("p.model_code"))
+
+	var rawRows []inventoryRawRow
+	if err := db.GetRead().Raw(sql, args...).Scan(&rawRows).Error; err != nil {
+		resp.Panic(err).Send()
+		return
+	}
+
+	if len(rawRows) == 0 {
+		resp.Success("成功").SetData(map[string]interface{}{
+			"rows": []inventoryRow{},
+		}).Send()
+		return
+	}
+
+	// 聚合：key = product_id + customer_id
+	type aggKey struct {
+		ProductID  int64
+		CustomerID int64
+	}
+	aggMap := map[aggKey]*inventoryRow{}
+	var aggOrder []aggKey
+
+	// 收集用到的 size_group_id
+	sizeGroupIDs := map[int64]bool{}
+
+	for _, raw := range rawRows {
+		key := aggKey{raw.ProductID, raw.CustomerID}
+		row, exists := aggMap[key]
+		if !exists {
+			row = &inventoryRow{
+				ProductID:         raw.ProductID,
+				ModelCode:         raw.ModelCode,
+				NameSpec:          raw.NameSpec,
+				CustomerID:        raw.CustomerID,
+				CustomerShortName: raw.CustomerShortName,
+				SizeGroupID:       raw.SizeGroupID,
+				SizeGroupCode:     raw.SizeGroupCode,
+				CostStart:         raw.CostStart,
+				WholesaleTaxIncl:  raw.WholesaleTaxIncl,
+				MSRP:              raw.MSRP,
+				CreatedOn:         raw.CreatedOn,
+				Sizes:             map[string]int{},
+			}
+			aggMap[key] = row
+			aggOrder = append(aggOrder, key)
+		}
+
+		sizeKey := strconv.FormatInt(raw.SizeOptionID, 10)
+		row.Sizes[sizeKey] += raw.Qty
+		row.TotalQty += raw.Qty
+
+		if raw.SizeGroupID > 0 {
+			sizeGroupIDs[raw.SizeGroupID] = true
+		}
+	}
+
+	// 查出所有用到的 size group 的完整 options
+	sizeGroupOptionsMap := map[int64][]inventorySizeCol{}
+	if len(sizeGroupIDs) > 0 {
+		ids := make([]int64, 0, len(sizeGroupIDs))
+		for id := range sizeGroupIDs {
+			ids = append(ids, id)
+		}
+
+		var options []models.SizeOption
+		db.GetRead().Where("size_group_id IN ?", ids).Order("sort_order ASC, id ASC").Find(&options)
+
+		for _, o := range options {
+			sizeGroupOptionsMap[o.SizeGroupID] = append(sizeGroupOptionsMap[o.SizeGroupID], inventorySizeCol{
+				ID:        o.ID,
+				Label:     o.Label,
+				SortOrder: o.SortOrder,
+			})
+		}
+	}
+
+	// 組裝 rows，填入完整 size_options
+	allRows := make([]inventoryRow, 0, len(aggOrder))
+	for _, key := range aggOrder {
+		row := aggMap[key]
+		row.SizeOptions = sizeGroupOptionsMap[row.SizeGroupID]
+		if row.SizeOptions == nil {
+			row.SizeOptions = []inventorySizeCol{}
+		}
+		allRows = append(allRows, *row)
+	}
+
+	// 計算全資料合計（分頁前）
+	// summarySizes 以 sort_order 為 key（對齊 Excel 合計位置加總的行為）：
+	// UI 的尺碼欄是 active row 的段碼 options 依 sort_order 排列，合計列對應同 sort_order
+	// 欄位要加總所有段碼在該位置的 qty，不因翻頁 active row 段碼切換而變動。
+	// 批價是 per-product 屬性,不做合計。
+	summaryTotalQty := 0
+	summarySizes := map[string]int{}
+	for _, r := range allRows {
+		summaryTotalQty += r.TotalQty
+	}
+	for _, raw := range rawRows {
+		if raw.Qty != 0 {
+			summarySizes[strconv.Itoa(raw.SortOrder)] += raw.Qty
+		}
+	}
+
+	resp.Success("成功").SetData(map[string]interface{}{
+		"rows": allRows,
+		"summary": map[string]interface{}{
+			"total_qty": summaryTotalQty,
+			"sizes":     summarySizes,
+		},
+	}).SetTotal(int64(len(allRows))).Send()
+}
+
+// placeholders 產生 n 個 "?" 逗號分隔，供 IN 子句使用
+func placeholders(n int) string {
+	if n <= 0 {
+		return ""
+	}
+	return strings.TrimSuffix(strings.Repeat("?,", n), ",")
+}

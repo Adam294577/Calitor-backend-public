@@ -1,0 +1,516 @@
+package controllers
+
+import (
+	"math"
+	"net/http"
+	"project/models"
+	"project/services/common"
+	"project/services/permission"
+	response "project/services/responses"
+	"strconv"
+	"time"
+
+	"github.com/gin-gonic/gin"
+	"gorm.io/gorm"
+)
+
+func GetProducts(c *gin.Context) {
+	if tryListCache(c) {
+		return
+	}
+	resp := response.New(c)
+	db := models.PostgresNew()
+	defer db.Close()
+
+	var items []models.Product
+	query := db.GetRead().Order(ModelCodeOrderBy("model_code"))
+	query = ApplySearch(query, c.Query("search"), "model_code", "name_spec")
+	if mc := c.Query("model_code"); mc != "" {
+		query = query.Where("model_code ILIKE ?", "%"+mc+"%")
+	}
+	if ns := c.Query("name_spec"); ns != "" {
+		query = query.Where("name_spec ILIKE ?", "%"+ns+"%")
+	}
+	if brandId := c.Query("brand_id"); brandId != "" {
+		query = query.Where("brand_id = ?", brandId)
+	}
+	if vendorId := c.Query("vendor_id"); vendorId != "" {
+		query = query.Where("id IN (SELECT product_id FROM product_vendors WHERE vendor_id = ?)", vendorId)
+	}
+	paged, total := Paginate(c, query, &models.Product{})
+	paged.
+		Preload("ProductBrand").
+		Preload("ProductVendors.Vendor").
+		Find(&items)
+	setListCache(c, items, total)
+	resp.Success("成功").SetData(items).SetTotal(total).Send()
+}
+
+func GetProduct(c *gin.Context) {
+	resp := response.New(c)
+	id, err := strconv.ParseInt(c.Param("id"), 10, 64)
+	if err != nil {
+		resp.Fail(http.StatusBadRequest, "無效的 ID").Send()
+		return
+	}
+
+	db := models.PostgresNew()
+	defer db.Close()
+
+	var item models.Product
+	err = db.GetRead().
+		Preload("ProductBrand").
+		Preload("Brand").
+		Preload("Size1Group.Options", func(db *gorm.DB) *gorm.DB {
+			return db.Order("sort_order ASC")
+		}).
+		Preload("Size2Group.Options", func(db *gorm.DB) *gorm.DB {
+			return db.Order("sort_order ASC")
+		}).
+		Preload("Size3Group.Options", func(db *gorm.DB) *gorm.DB {
+			return db.Order("sort_order ASC")
+		}).
+		Preload("ProductVendors.Vendor").
+		Preload("CategoryMaps.Category1").
+		Preload("CategoryMaps.Category2").
+		Preload("CategoryMaps.Category3").
+		Preload("CategoryMaps.Category4").
+		Preload("CategoryMaps.Category5").
+		Where("id = ?", id).
+		First(&item).Error
+	if err != nil {
+		resp.Fail(http.StatusNotFound, "商品不存在").Send()
+		return
+	}
+	resp.Success("成功").SetData(item).Send()
+}
+
+// lookupBrandCode 由對帳品牌 ID 查 brands.code,用於同步寫入 product.billing_brand。
+// shipments.vue 仍用 billing_brand 字串排序,所以要與 brand_id 一起維護。
+func lookupBrandCode(db *models.DBManager, id *int64) string {
+	if id == nil {
+		return ""
+	}
+	var b models.Brand
+	if err := db.GetRead().Select("code").Where("id = ?", *id).First(&b).Error; err != nil {
+		return ""
+	}
+	return b.Code
+}
+
+func CreateProduct(c *gin.Context) {
+	resp := response.New(c)
+	db := models.PostgresNew()
+	defer db.Close()
+
+	var req struct {
+		ModelCode         string  `json:"model_code" binding:"required"`
+		Currency          string  `json:"currency"`
+		NameSpec          string  `json:"name_spec"`
+		MSRP              float64 `json:"msrp"`
+		SpecialPrice      float64 `json:"special_price"`
+		OriginalPrice     float64 `json:"original_price"`
+		WholesaleTaxIncl  float64 `json:"wholesale_tax_incl"`
+		WholesaleDiscount float64 `json:"wholesale_discount"`
+		BrandID           *int64  `json:"brand_id"`
+		ProductBrandID    *int64  `json:"product_brand_id"`
+		TradeMode         int64   `json:"trade_mode"`
+		IsVisible         bool    `json:"is_visible"`
+		Season            string  `json:"season"`
+		Remark            string  `json:"remark"`
+		MaterialOuter     string  `json:"material_outer"`
+		MaterialInner     string  `json:"material_inner"`
+		ToeCaptrim        string  `json:"toe_cap_trim"`
+		Lining            string  `json:"lining"`
+		Sock              string  `json:"sock"`
+		Sole              string  `json:"sole"`
+		ImageURL          string  `json:"image_url"`
+		Size1GroupID      *int64  `json:"size1_group_id"`
+		Size2GroupID      *int64  `json:"size2_group_id"`
+		Size3GroupID      *int64  `json:"size3_group_id"`
+		CategoryMaps      []struct {
+			CategoryType int    `json:"category_type"`
+			Category1ID  *int64 `json:"category1_id"`
+			Category2ID  *int64 `json:"category2_id"`
+			Category3ID  *int64 `json:"category3_id"`
+			Category4ID  *int64 `json:"category4_id"`
+			Category5ID  *int64 `json:"category5_id"`
+		} `json:"category_maps"`
+		ProductVendors []struct {
+			VendorID      int64   `json:"vendor_id"`
+			CostDiscount  float64 `json:"cost_discount"`
+			CostStart     float64 `json:"cost_start"`
+			CostLast      float64 `json:"cost_last"`
+			OriginalPrice float64 `json:"original_price"`
+			IsPrimary     bool    `json:"is_primary"`
+		} `json:"product_vendors"`
+	}
+	if err := c.ShouldBindJSON(&req); err != nil {
+		resp.Fail(http.StatusBadRequest, "資料格式錯誤").Send()
+		return
+	}
+
+	// 正規化料號：去頭尾空白＋轉大寫（使唯一性檢查與落 DB 一致）
+	req.ModelCode = common.NormalizeModelCode(req.ModelCode)
+
+	var count int64
+	db.GetRead().Model(&models.Product{}).Where("model_code = ?", req.ModelCode).Count(&count)
+	if count > 0 {
+		resp.Fail(http.StatusBadRequest, "型號已存在").Send()
+		return
+	}
+
+	now := time.Now()
+	product := models.Product{
+		ModelCode:         req.ModelCode,
+		Currency:          req.Currency,
+		NameSpec:          req.NameSpec,
+		MSRP:              req.MSRP,
+		SpecialPrice:      req.SpecialPrice,
+		OriginalPrice:     req.OriginalPrice,
+		WholesaleTaxIncl:  req.WholesaleTaxIncl,
+		Wholesale:         math.Round(req.WholesaleTaxIncl / 1.05),
+		WholesaleDiscount: req.WholesaleDiscount,
+		BrandId:           req.BrandID,
+		BillingBrand:      lookupBrandCode(db, req.BrandID),
+		ProductBrandId:    req.ProductBrandID,
+		TradeMode:         req.TradeMode,
+		IsVisible:         req.IsVisible,
+		Season:            req.Season,
+		Remark:            req.Remark,
+		MaterialOuter:     req.MaterialOuter,
+		MaterialInner:     req.MaterialInner,
+		ToeCapTrim:        req.ToeCaptrim,
+		Lining:            req.Lining,
+		Sock:              req.Sock,
+		Sole:              req.Sole,
+		ImageURL:          req.ImageURL,
+		Size1GroupID:      req.Size1GroupID,
+		Size2GroupID:      req.Size2GroupID,
+		Size3GroupID:      req.Size3GroupID,
+		CreatedOn:         &now,
+	}
+
+	err := db.GetWrite().Transaction(func(tx *gorm.DB) error {
+		if err := tx.Create(&product).Error; err != nil {
+			return err
+		}
+		// 建立 CategoryMaps
+		for _, cm := range req.CategoryMaps {
+			item := models.ProductCategoryMap{
+				ProductID:    product.ID,
+				CategoryType: cm.CategoryType,
+				Category1ID:  cm.Category1ID,
+				Category2ID:  cm.Category2ID,
+				Category3ID:  cm.Category3ID,
+				Category4ID:  cm.Category4ID,
+				Category5ID:  cm.Category5ID,
+			}
+			if err := tx.Create(&item).Error; err != nil {
+				return err
+			}
+		}
+		// 建立 ProductVendors
+		// 業務規則：每個 product 只能 1 個 is_primary=true。
+		// 若 req 多個 is_primary=true，保留第一個；若都沒設且 list 非空，第一個強制設為 primary。
+		primarySet := false
+		for i := range req.ProductVendors {
+			if req.ProductVendors[i].IsPrimary {
+				if primarySet {
+					req.ProductVendors[i].IsPrimary = false
+				} else {
+					primarySet = true
+				}
+			}
+		}
+		if !primarySet && len(req.ProductVendors) > 0 {
+			req.ProductVendors[0].IsPrimary = true
+		}
+		for _, pv := range req.ProductVendors {
+			item := models.ProductVendor{
+				ProductID:     product.ID,
+				VendorID:      pv.VendorID,
+				CostDiscount:  pv.CostDiscount,
+				CostStart:     pv.CostStart,
+				CostLast:      pv.CostLast,
+				OriginalPrice: pv.OriginalPrice,
+				IsPrimary:     pv.IsPrimary,
+			}
+			if err := tx.Create(&item).Error; err != nil {
+				return err
+			}
+		}
+		return nil
+	})
+	if err != nil {
+		resp.Panic(err).Send()
+		return
+	}
+
+	invalidateListCache("products")
+	resp.Success("新增成功").SetData(product).Send()
+}
+
+func UpdateProduct(c *gin.Context) {
+	resp := response.New(c)
+	id, err := strconv.ParseInt(c.Param("id"), 10, 64)
+	if err != nil {
+		resp.Fail(http.StatusBadRequest, "無效的 ID").Send()
+		return
+	}
+
+	db := models.PostgresNew()
+	defer db.Close()
+
+	var existing models.Product
+	if err := db.GetRead().Where("id = ?", id).First(&existing).Error; err != nil {
+		resp.Fail(http.StatusBadRequest, "資料不存在").Send()
+		return
+	}
+
+	var rawReq map[string]interface{}
+	if err := c.ShouldBindJSON(&rawReq); err != nil {
+		resp.Fail(http.StatusBadRequest, "資料格式錯誤").Send()
+		return
+	}
+
+	// 無「編輯主檔代碼」權限者，忽略 model_code 欄位變更
+	permission.StripMasterCodeFields(c, rawReq, "model_code")
+
+	// 正規化料號：去頭尾空白＋轉大寫（使唯一性檢查與 Updates 一致）
+	if code, ok := rawReq["model_code"].(string); ok {
+		rawReq["model_code"] = common.NormalizeModelCode(code)
+	}
+
+	// 檢查 model_code 唯一性
+	if code, ok := rawReq["model_code"].(string); ok && code != "" && code != existing.ModelCode {
+		var count int64
+		db.GetRead().Model(&models.Product{}).Where("model_code = ? AND id != ?", code, id).Count(&count)
+		if count > 0 {
+			resp.Fail(http.StatusBadRequest, "型號已存在").Send()
+			return
+		}
+	}
+
+	// 取出 category_maps
+	var categoryMaps []interface{}
+	hasCategoryMaps := false
+	if raw, ok := rawReq["category_maps"]; ok {
+		hasCategoryMaps = true
+		if arr, ok := raw.([]interface{}); ok {
+			categoryMaps = arr
+		}
+	}
+
+	// 取出 product_vendors
+	var productVendors []interface{}
+	hasProductVendors := false
+	if raw, ok := rawReq["product_vendors"]; ok {
+		hasProductVendors = true
+		if arr, ok := raw.([]interface{}); ok {
+			productVendors = arr
+		}
+	}
+
+	// 含稅批價 → 自動計算未稅批價
+	if v, ok := rawReq["wholesale_tax_incl"].(float64); ok {
+		rawReq["wholesale"] = math.Round(v / 1.05)
+	}
+
+	// brand_id 變更時,同步覆寫 billing_brand 為對應 brand.code
+	if v, ok := rawReq["brand_id"]; ok {
+		var bid *int64
+		if f, ok := v.(float64); ok {
+			id := int64(f)
+			bid = &id
+		}
+		rawReq["billing_brand"] = lookupBrandCode(db, bid)
+	}
+
+	// 移除不可更新的欄位
+	for _, key := range []string{"id", "created_at", "deleted_at", "product_brand", "brand", "category_maps", "product_vendors", "size1_group", "size2_group", "size3_group"} {
+		delete(rawReq, key)
+	}
+
+	err = db.GetWrite().Transaction(func(tx *gorm.DB) error {
+		if len(rawReq) > 0 {
+			if err := tx.Model(&existing).Updates(rawReq).Error; err != nil {
+				return err
+			}
+		}
+		// 重建 CategoryMaps
+		if hasCategoryMaps {
+			tx.Where("product_id = ?", id).Delete(&models.ProductCategoryMap{})
+			for _, raw := range categoryMaps {
+				m, ok := raw.(map[string]interface{})
+				if !ok {
+					continue
+				}
+				cm := models.ProductCategoryMap{ProductID: id}
+				if v, ok := m["category_type"].(float64); ok {
+					cm.CategoryType = int(v)
+				}
+				if v, ok := m["category1_id"].(float64); ok {
+					vid := int64(v)
+					cm.Category1ID = &vid
+				}
+				if v, ok := m["category2_id"].(float64); ok {
+					vid := int64(v)
+					cm.Category2ID = &vid
+				}
+				if v, ok := m["category3_id"].(float64); ok {
+					vid := int64(v)
+					cm.Category3ID = &vid
+				}
+				if v, ok := m["category4_id"].(float64); ok {
+					vid := int64(v)
+					cm.Category4ID = &vid
+				}
+				if v, ok := m["category5_id"].(float64); ok {
+					vid := int64(v)
+					cm.Category5ID = &vid
+				}
+				if err := tx.Create(&cm).Error; err != nil {
+					return err
+				}
+			}
+		}
+		// 重建 ProductVendors
+		// 業務規則：每個 product 只能 1 個 is_primary=true（同 CreateProduct）
+		if hasProductVendors {
+			tx.Where("product_id = ?", id).Delete(&models.ProductVendor{})
+			pvs := make([]models.ProductVendor, 0, len(productVendors))
+			for _, raw := range productVendors {
+				m, ok := raw.(map[string]interface{})
+				if !ok {
+					continue
+				}
+				pv := models.ProductVendor{ProductID: id}
+				if v, ok := m["vendor_id"].(float64); ok {
+					pv.VendorID = int64(v)
+				}
+				if v, ok := m["cost_discount"].(float64); ok {
+					pv.CostDiscount = v
+				}
+				if v, ok := m["cost_start"].(float64); ok {
+					pv.CostStart = v
+				}
+				if v, ok := m["cost_last"].(float64); ok {
+					pv.CostLast = v
+				}
+				if v, ok := m["original_price"].(float64); ok {
+					pv.OriginalPrice = v
+				}
+				if v, ok := m["is_primary"].(bool); ok {
+					pv.IsPrimary = v
+				}
+				pvs = append(pvs, pv)
+			}
+			// normalize：保留第一個 is_primary=true，其餘 false；若都沒設，第一個強制設為 primary
+			primarySet := false
+			for i := range pvs {
+				if pvs[i].IsPrimary {
+					if primarySet {
+						pvs[i].IsPrimary = false
+					} else {
+						primarySet = true
+					}
+				}
+			}
+			if !primarySet && len(pvs) > 0 {
+				pvs[0].IsPrimary = true
+			}
+			for _, pv := range pvs {
+				if err := tx.Create(&pv).Error; err != nil {
+					return err
+				}
+			}
+		}
+		return nil
+	})
+	if err != nil {
+		resp.Panic(err).Send()
+		return
+	}
+
+	invalidateListCache("products")
+	resp.Success("更新成功").Send()
+}
+
+func DeleteProduct(c *gin.Context) {
+	resp := response.New(c)
+	id, err := strconv.ParseInt(c.Param("id"), 10, 64)
+	if err != nil {
+		resp.Fail(http.StatusBadRequest, "無效的 ID").Send()
+		return
+	}
+
+	db := models.PostgresNew()
+	defer db.Close()
+
+	err = db.GetWrite().Transaction(func(tx *gorm.DB) error {
+		tx.Where("product_id = ?", id).Delete(&models.ProductCategoryMap{})
+		tx.Where("product_id = ?", id).Delete(&models.ProductVendor{})
+		return tx.Delete(&models.Product{}, id).Error
+	})
+	if err != nil {
+		resp.Panic(err).Send()
+		return
+	}
+
+	invalidateListCache("products")
+	resp.Success("刪除成功").Send()
+}
+
+// GetProductStocksBatch 批次查詢多商品在指定庫點/客戶的 size_stocks。
+// 給 SizeQtyTable 切換 customer/store 時刷新已選明細的庫存量,避免 N 次 searchProducts 並行打 API。
+// Body: { product_ids: int64[], customer_id?: int64, store_code?: string }
+// Response: { stocks: { "<product_id>": [ProductSizeStock, ...] } }
+func GetProductStocksBatch(c *gin.Context) {
+	resp := response.New(c)
+
+	var req struct {
+		ProductIDs []int64 `json:"product_ids" binding:"required"`
+		CustomerID int64   `json:"customer_id"`
+		StoreCode  string  `json:"store_code"`
+	}
+	if err := c.ShouldBindJSON(&req); err != nil {
+		resp.Fail(http.StatusBadRequest, "資料格式錯誤").Send()
+		return
+	}
+	if len(req.ProductIDs) == 0 {
+		resp.Success("成功").SetData(map[string]interface{}{
+			"stocks": map[string][]models.ProductSizeStock{},
+		}).Send()
+		return
+	}
+	if req.CustomerID == 0 && req.StoreCode == "" {
+		resp.Fail(http.StatusBadRequest, "需指定 customer_id 或 store_code").Send()
+		return
+	}
+
+	db := models.PostgresNew()
+	defer db.Close()
+
+	var stocks []models.ProductSizeStock
+	q := db.GetRead().Where("product_id IN ?", req.ProductIDs)
+	if req.StoreCode != "" {
+		q = q.Where("customer_id IN (SELECT id FROM retail_customers WHERE branch_code = ?)", req.StoreCode)
+	} else {
+		q = q.Where("customer_id = ?", req.CustomerID)
+	}
+	if err := q.Find(&stocks).Error; err != nil {
+		resp.Panic(err).Send()
+		return
+	}
+
+	stockMap := map[string][]models.ProductSizeStock{}
+	for _, s := range stocks {
+		key := strconv.FormatInt(s.ProductID, 10)
+		stockMap[key] = append(stockMap[key], s)
+	}
+
+	resp.Success("成功").SetData(map[string]interface{}{
+		"stocks": stockMap,
+	}).Send()
+}

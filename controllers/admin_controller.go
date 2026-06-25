@@ -1,0 +1,939 @@
+package controllers
+
+import (
+	"net/http"
+	"project/middlewares"
+	"project/models"
+	"project/services/common"
+	"project/services/library"
+	"project/services/log"
+	response "project/services/responses"
+	"strconv"
+
+	"github.com/gin-gonic/gin"
+	"gorm.io/gorm"
+)
+
+// loginRequest 登入請求
+type loginRequest struct {
+	Account  string `json:"account" binding:"required"`
+	Password string `json:"password" binding:"required"`
+}
+
+// Login 登入
+func Login(c *gin.Context) {
+	resp := response.New(c)
+	var req loginRequest
+	if err := c.ShouldBindJSON(&req); err != nil {
+		resp.Fail(http.StatusBadRequest, "請輸入帳號和密碼").Send()
+		return
+	}
+
+	db := models.PostgresNew()
+	defer db.Close()
+
+	ip := c.ClientIP()
+
+	// 查詢帳號
+	var admin models.Admin
+	if err := db.GetRead().Where("account = ?", req.Account).First(&admin).Error; err != nil {
+		log.Warn("登入失敗: IP=%s 帳號=%s（帳號不存在）", ip, req.Account)
+		middlewares.LoginRateLimitIncrNonexistent(ip)
+		resp.Fail(http.StatusBadRequest, "帳號或密碼錯誤").Send()
+		return
+	}
+
+	// 檢查停權
+	if admin.IsDisabled {
+		log.Warn("登入失敗: IP=%s 帳號=%s（帳號已停權）", ip, req.Account)
+		resp.Fail(http.StatusBadRequest, "帳號已停權").Send()
+		return
+	}
+
+	// 驗證密碼
+	if !common.CheckPasswordHash(admin.Password, req.Password) {
+		log.Warn("登入失敗: IP=%s 帳號=%s（密碼錯誤）", ip, req.Account)
+		middlewares.LoginRateLimitIncrUser(req.Account, ip)
+		resp.Fail(http.StatusBadRequest, "帳號或密碼錯誤").Send()
+		return
+	}
+
+	// 登入成功，重置 (帳號, IP) 計數(nonexistent IP 計數不重置)
+	middlewares.LoginRateLimitResetUser(req.Account, ip)
+
+	// 查詢角色 ID
+	roleIds := getAdminRoleIds(db, admin.ID)
+
+	// 查詢權限
+	permissions := getAdminPermissions(db, &admin, roleIds)
+
+	// 產生 JWT token（含權限）
+	token, err := library.GenerateAdminToken(library.AdminTokenClaims{
+		AdminId:     admin.ID,
+		Account:     admin.Account,
+		RoleIds:     roleIds,
+		Permissions: permissions,
+	})
+	if err != nil {
+		resp.Panic(err).Send()
+		return
+	}
+
+	// 查詢角色名稱
+	var roleNames []string
+	if len(roleIds) > 0 {
+		var roles []models.Role
+		db.GetRead().Where("id IN ?", roleIds).Find(&roles)
+		for _, r := range roles {
+			roleNames = append(roleNames, r.Name)
+		}
+	}
+
+	resp.Success("登入成功").SetData(gin.H{
+		"token": token,
+		"admin": gin.H{
+			"id":          admin.ID,
+			"account":     admin.Account,
+			"name":        admin.Name,
+			"role_ids":    roleIds,
+			"is_super":    admin.IsSuper,
+			"is_disabled": admin.IsDisabled,
+			"role_names":  roleNames,
+		},
+	}).Send()
+}
+
+// GetMe 取得當前使用者資訊
+func GetMe(c *gin.Context) {
+	resp := response.New(c)
+	adminId := getAdminId(c)
+
+	db := models.PostgresNew()
+	defer db.Close()
+
+	var admin models.Admin
+	if err := db.GetRead().Where("id = ?", adminId).First(&admin).Error; err != nil {
+		resp.Fail(http.StatusUnauthorized, "使用者不存在").Send()
+		return
+	}
+
+	// 查詢角色
+	roleIds := getAdminRoleIds(db, admin.ID)
+	var roleNames []string
+	if len(roleIds) > 0 {
+		var roles []models.Role
+		db.GetRead().Where("id IN ?", roleIds).Find(&roles)
+		for _, r := range roles {
+			roleNames = append(roleNames, r.Name)
+		}
+	}
+
+	// 查詢權限並產生新 token
+	permissions := getAdminPermissions(db, &admin, roleIds)
+	token, err := library.GenerateAdminToken(library.AdminTokenClaims{
+		AdminId:     admin.ID,
+		Account:     admin.Account,
+		RoleIds:     roleIds,
+		Permissions: permissions,
+	})
+	if err != nil {
+		resp.Panic(err).Send()
+		return
+	}
+
+	resp.Success("成功").SetData(gin.H{
+		"token": token,
+		"admin": gin.H{
+			"id":         admin.ID,
+			"account":    admin.Account,
+			"name":       admin.Name,
+			"role_ids":   roleIds,
+			"is_super":   admin.IsSuper,
+			"role_names": roleNames,
+		},
+	}).Send()
+}
+
+// changePasswordRequest 修改密碼請求
+type changePasswordRequest struct {
+	OldPassword string `json:"old_password" binding:"required"`
+	NewPassword string `json:"new_password" binding:"required"`
+}
+
+// ChangePassword 修改密碼
+func ChangePassword(c *gin.Context) {
+	resp := response.New(c)
+	var req changePasswordRequest
+	if err := c.ShouldBindJSON(&req); err != nil {
+		resp.Fail(http.StatusBadRequest, "請輸入舊密碼和新密碼").Send()
+		return
+	}
+
+	adminId := getAdminId(c)
+
+	db := models.PostgresNew()
+	defer db.Close()
+
+	var admin models.Admin
+	if err := db.GetRead().Where("id = ?", adminId).First(&admin).Error; err != nil {
+		resp.Fail(http.StatusBadRequest, "使用者不存在").Send()
+		return
+	}
+
+	// 驗證舊密碼
+	if !common.CheckPasswordHash(admin.Password, req.OldPassword) {
+		resp.Fail(http.StatusBadRequest, "舊密碼錯誤").Send()
+		return
+	}
+
+	// 更新密碼
+	hashedPassword, err := common.HashPassword(req.NewPassword)
+	if err != nil {
+		resp.Panic(err).Send()
+		return
+	}
+
+	db.GetWrite().Model(&admin).Update("password", hashedPassword)
+	resp.Success("密碼修改成功").Send()
+}
+
+// createAccountRequest 新增帳號請求
+type createAccountRequest struct {
+	Account  string  `json:"account" binding:"required"`
+	Name     string  `json:"name" binding:"required"`
+	Password string  `json:"password" binding:"required"`
+	RoleIds  []int64 `json:"role_ids" binding:"required,min=1"`
+}
+
+// CreateAccount 新增帳號
+func CreateAccount(c *gin.Context) {
+	resp := response.New(c)
+	var req createAccountRequest
+	if err := c.ShouldBindJSON(&req); err != nil {
+		resp.Fail(http.StatusBadRequest, "請填寫完整資料").Send()
+		return
+	}
+
+	db := models.PostgresNew()
+	defer db.Close()
+
+	// 檢查帳號是否重複
+	var count int64
+	db.GetRead().Model(&models.Admin{}).Where("account = ?", req.Account).Count(&count)
+	if count > 0 {
+		resp.Fail(http.StatusBadRequest, "帳號已存在").Send()
+		return
+	}
+
+	// 檢查角色是否都存在
+	var roleCount int64
+	db.GetRead().Model(&models.Role{}).Where("id IN ?", req.RoleIds).Count(&roleCount)
+	if roleCount != int64(len(req.RoleIds)) {
+		resp.Fail(http.StatusBadRequest, "部分角色不存在").Send()
+		return
+	}
+
+	hashedPassword, err := common.HashPassword(req.Password)
+	if err != nil {
+		resp.Panic(err).Send()
+		return
+	}
+
+	admin := models.Admin{
+		Account:  req.Account,
+		Name:     req.Name,
+		Password: hashedPassword,
+	}
+	err = db.GetWrite().Transaction(func(tx *gorm.DB) error {
+		if err := tx.Create(&admin).Error; err != nil {
+			return err
+		}
+		if len(req.RoleIds) == 0 {
+			return nil
+		}
+		ars := make([]models.AdminRole, 0, len(req.RoleIds))
+		for _, roleId := range req.RoleIds {
+			ars = append(ars, models.AdminRole{AdminId: admin.ID, RoleId: roleId})
+		}
+		return tx.CreateInBatches(ars, 500).Error
+	})
+	if err != nil {
+		resp.Panic(err).Send()
+		return
+	}
+
+	resp.Success("新增成功").SetData(admin).Send()
+}
+
+// GetAccounts 帳號列表
+func GetAccounts(c *gin.Context) {
+	resp := response.New(c)
+
+	db := models.PostgresNew()
+	defer db.Close()
+
+	var admins []models.Admin
+	db.GetRead().Order("id ASC").Find(&admins)
+
+	// 查詢所有角色關聯
+	var allAdminRoles []models.AdminRole
+	db.GetRead().Find(&allAdminRoles)
+
+	// 查詢所有角色
+	var allRoles []models.Role
+	db.GetRead().Find(&allRoles)
+	roleMap := map[int64]string{}
+	for _, r := range allRoles {
+		roleMap[r.ID] = r.Name
+	}
+
+	// 組裝 adminId → roleIds / roleNames
+	adminRoleMap := map[int64][]int64{}
+	adminRoleNameMap := map[int64][]string{}
+	for _, ar := range allAdminRoles {
+		adminRoleMap[ar.AdminId] = append(adminRoleMap[ar.AdminId], ar.RoleId)
+		if name, ok := roleMap[ar.RoleId]; ok {
+			adminRoleNameMap[ar.AdminId] = append(adminRoleNameMap[ar.AdminId], name)
+		}
+	}
+
+	type AccountItem struct {
+		models.Admin
+		RoleIds   []int64  `json:"role_ids"`
+		RoleNames []string `json:"role_names"`
+	}
+
+	result := make([]AccountItem, len(admins))
+	for i, a := range admins {
+		result[i] = AccountItem{
+			Admin:     a,
+			RoleIds:   adminRoleMap[a.ID],
+			RoleNames: adminRoleNameMap[a.ID],
+		}
+	}
+
+	resp.Success("成功").SetData(result).Send()
+}
+
+// updateAccountRequest 編輯帳號請求
+type updateAccountRequest struct {
+	Account string  `json:"account"`
+	Name    string  `json:"name"`
+	RoleIds []int64 `json:"role_ids"`
+}
+
+// UpdateAccount 編輯帳號
+func UpdateAccount(c *gin.Context) {
+	resp := response.New(c)
+	id, err := strconv.ParseInt(c.Param("id"), 10, 64)
+	if err != nil {
+		resp.Fail(http.StatusBadRequest, "無效的 ID").Send()
+		return
+	}
+
+	var req updateAccountRequest
+	if err := c.ShouldBindJSON(&req); err != nil {
+		resp.Fail(http.StatusBadRequest, "資料格式錯誤").Send()
+		return
+	}
+
+	db := models.PostgresNew()
+	defer db.Close()
+
+	var admin models.Admin
+	if err := db.GetRead().Where("id = ?", id).First(&admin).Error; err != nil {
+		resp.Fail(http.StatusBadRequest, "帳號不存在").Send()
+		return
+	}
+
+	// 檢查帳號是否重複（排除自己）
+	if req.Account != "" && req.Account != admin.Account {
+		var count int64
+		db.GetRead().Model(&models.Admin{}).Where("account = ? AND id != ?", req.Account, id).Count(&count)
+		if count > 0 {
+			resp.Fail(http.StatusBadRequest, "帳號已存在").Send()
+			return
+		}
+	}
+
+	updates := map[string]interface{}{}
+	if req.Account != "" {
+		updates["account"] = req.Account
+	}
+	if req.Name != "" {
+		updates["name"] = req.Name
+	}
+
+	err = db.GetWrite().Transaction(func(tx *gorm.DB) error {
+		if len(updates) > 0 {
+			if err := tx.Model(&admin).Updates(updates).Error; err != nil {
+				return err
+			}
+		}
+		// 更新角色關聯（全量替換）
+		if req.RoleIds != nil {
+			if err := tx.Where("admin_id = ?", id).Delete(&models.AdminRole{}).Error; err != nil {
+				return err
+			}
+			if len(req.RoleIds) > 0 {
+				ars := make([]models.AdminRole, 0, len(req.RoleIds))
+				for _, roleId := range req.RoleIds {
+					ars = append(ars, models.AdminRole{AdminId: id, RoleId: roleId})
+				}
+				if err := tx.CreateInBatches(ars, 500).Error; err != nil {
+					return err
+				}
+			}
+		}
+		return nil
+	})
+	if err != nil {
+		resp.Panic(err).Send()
+		return
+	}
+
+	resp.Success("更新成功").Send()
+}
+
+// disableAccountRequest 停權請求
+type disableAccountRequest struct {
+	IsDisabled bool `json:"is_disabled"`
+}
+
+// DisableAccount 停權/啟用帳號
+func DisableAccount(c *gin.Context) {
+	resp := response.New(c)
+	id, err := strconv.ParseInt(c.Param("id"), 10, 64)
+	if err != nil {
+		resp.Fail(http.StatusBadRequest, "無效的 ID").Send()
+		return
+	}
+
+	var req disableAccountRequest
+	if err := c.ShouldBindJSON(&req); err != nil {
+		resp.Fail(http.StatusBadRequest, "資料格式錯誤").Send()
+		return
+	}
+
+	db := models.PostgresNew()
+	defer db.Close()
+
+	var admin models.Admin
+	if err := db.GetRead().Where("id = ?", id).First(&admin).Error; err != nil {
+		resp.Fail(http.StatusBadRequest, "帳號不存在").Send()
+		return
+	}
+
+	// 不能停權超級帳號
+	if admin.IsSuper {
+		resp.Fail(http.StatusBadRequest, "無法停權超級帳號").Send()
+		return
+	}
+
+	db.GetWrite().Model(&admin).Update("is_disabled", req.IsDisabled)
+	resp.Success("更新成功").Send()
+}
+
+// resetAccountPasswordRequest 重設密碼請求
+type resetAccountPasswordRequest struct {
+	NewPassword string `json:"new_password" binding:"required"`
+}
+
+// ResetAccountPassword 管理員重設帳號密碼
+func ResetAccountPassword(c *gin.Context) {
+	resp := response.New(c)
+	id, err := strconv.ParseInt(c.Param("id"), 10, 64)
+	if err != nil {
+		resp.Fail(http.StatusBadRequest, "無效的 ID").Send()
+		return
+	}
+
+	// 自己重設自己永遠允許；改別人需要 accounts.reset_password 權限
+	if id != getAdminId(c) && !middlewares.HasPermission(c, "accounts.reset_password") {
+		resp.Fail(http.StatusForbidden, "無權限重設他人密碼").Send()
+		return
+	}
+
+	var req resetAccountPasswordRequest
+	if err := c.ShouldBindJSON(&req); err != nil {
+		resp.Fail(http.StatusBadRequest, "請輸入新密碼").Send()
+		return
+	}
+
+	db := models.PostgresNew()
+	defer db.Close()
+
+	var admin models.Admin
+	if err := db.GetRead().Where("id = ?", id).First(&admin).Error; err != nil {
+		resp.Fail(http.StatusBadRequest, "帳號不存在").Send()
+		return
+	}
+
+	hashedPassword, err := common.HashPassword(req.NewPassword)
+	if err != nil {
+		resp.Panic(err).Send()
+		return
+	}
+
+	db.GetWrite().Model(&admin).Update("password", hashedPassword)
+	resp.Success("密碼重設成功").Send()
+}
+
+// GetRoles 角色列表
+func GetRoles(c *gin.Context) {
+	resp := response.New(c)
+
+	db := models.PostgresNew()
+	defer db.Close()
+
+	var roles []models.Role
+	db.GetRead().Order("id ASC").Find(&roles)
+	resp.Success("成功").SetData(roles).Send()
+}
+
+// GetPermissions 權限列表
+func GetPermissions(c *gin.Context) {
+	resp := response.New(c)
+
+	db := models.PostgresNew()
+	defer db.Close()
+
+	var permissions []models.Permission
+	db.GetRead().Order("sort ASC").Find(&permissions)
+	resp.Success("成功").SetData(permissions).Send()
+}
+
+// getAdminRoleIds 取得帳號的所有角色 ID
+func getAdminRoleIds(db *models.DBManager, adminId int64) []int64 {
+	var adminRoles []models.AdminRole
+	db.GetRead().Where("admin_id = ?", adminId).Find(&adminRoles)
+	ids := make([]int64, len(adminRoles))
+	for i, ar := range adminRoles {
+		ids[i] = ar.RoleId
+	}
+	return ids
+}
+
+// getAdminPermissions 取得管理員權限列表（含向上補齊祖先節點）
+func getAdminPermissions(db *models.DBManager, admin *models.Admin, roleIds []int64) []string {
+	var permissions []models.Permission
+
+	if admin.IsSuper {
+		db.GetRead().Order("sort ASC").Find(&permissions)
+	} else if len(roleIds) > 0 {
+		db.GetRead().
+			Joins("JOIN role_permissions ON role_permissions.permission_id = permissions.id").
+			Where("role_permissions.role_id IN ?", roleIds).
+			Group("permissions.id").
+			Order("permissions.sort ASC").
+			Find(&permissions)
+	}
+
+	// 收集已有的 ID
+	idSet := make(map[int64]bool)
+	for _, p := range permissions {
+		idSet[p.ID] = true
+	}
+
+	// 向上補齊：找出所有祖先節點，讓 sidebar 群組能正常顯示
+	var parentIds []int64
+	for _, p := range permissions {
+		if p.ParentId != nil && !idSet[*p.ParentId] {
+			parentIds = append(parentIds, *p.ParentId)
+		}
+	}
+	for len(parentIds) > 0 {
+		var parents []models.Permission
+		db.GetRead().Where("id IN ?", parentIds).Find(&parents)
+		parentIds = nil
+		for _, p := range parents {
+			if !idSet[p.ID] {
+				permissions = append(permissions, p)
+				idSet[p.ID] = true
+				if p.ParentId != nil && !idSet[*p.ParentId] {
+					parentIds = append(parentIds, *p.ParentId)
+				}
+			}
+		}
+	}
+
+	keys := make([]string, len(permissions))
+	for i, p := range permissions {
+		keys[i] = p.Key
+	}
+	return keys
+}
+
+// getAdminId 從 context 取得 AdminId
+func getAdminId(c *gin.Context) int64 {
+	adminIdVal, _ := c.Get("AdminId")
+	if adminIdVal == nil {
+		return 0
+	}
+	if id, ok := adminIdVal.(float64); ok {
+		return int64(id)
+	}
+	return 0
+}
+
+// isCurrentAdminSuper 檢查當前登入者是否為超級帳號
+func isCurrentAdminSuper(c *gin.Context, db *models.DBManager) bool {
+	adminId := getAdminId(c)
+	var admin models.Admin
+	if err := db.GetRead().Where("id = ?", adminId).First(&admin).Error; err != nil {
+		return false
+	}
+	return admin.IsSuper
+}
+
+// GetPermissionTree 取得權限樹狀結構
+func GetPermissionTree(c *gin.Context) {
+	resp := response.New(c)
+
+	db := models.PostgresNew()
+	defer db.Close()
+
+	var permissions []models.Permission
+	db.GetRead().Where("parent_id IS NULL").Order("sort ASC").
+		Preload("Children", func(db *gorm.DB) *gorm.DB {
+			return db.Order("sort ASC")
+		}).
+		Preload("Children.Children", func(db *gorm.DB) *gorm.DB {
+			return db.Order("sort ASC")
+		}).
+		Find(&permissions)
+
+	resp.Success("成功").SetData(permissions).Send()
+}
+
+// GetMenuSettingsTree 取得「選單設定」用的樹（只含第 1、2 層，不含 CRUD 葉子）
+func GetMenuSettingsTree(c *gin.Context) {
+	resp := response.New(c)
+
+	db := models.PostgresNew()
+	defer db.Close()
+
+	var permissions []models.Permission
+	db.GetRead().
+		Where("parent_id IS NULL").
+		Where("kind = ?", "page").
+		Order("sort ASC").
+		Preload("Children", func(db *gorm.DB) *gorm.DB {
+			return db.Where("kind = ?", "page").Order("sort ASC")
+		}).
+		Find(&permissions)
+
+	// 清空 children 內可能殘留的 Children 欄位（雖然沒 preload 第 3 層，
+	// 但確保 JSON 不出現 children: null vs []，前端統一處理）
+	for i := range permissions {
+		for j := range permissions[i].Children {
+			permissions[i].Children[j].Children = nil
+		}
+	}
+
+	resp.Success("成功").SetData(permissions).Send()
+}
+
+// menuSettingsItem 單一更新項目
+type menuSettingsItem struct {
+	ID       int64  `json:"id" binding:"required"`
+	Name     string `json:"name" binding:"required"`
+	Sort     int    `json:"sort"`
+	ParentId *int64 `json:"parent_id"`
+}
+
+// updateMenuSettingsRequest 更新請求
+type updateMenuSettingsRequest struct {
+	Items []menuSettingsItem `json:"items" binding:"required"`
+}
+
+// UpdateMenuSettings 更新選單設定（僅可改第 1、2 層的 name 與 sort，不允許跨父層搬家）
+func UpdateMenuSettings(c *gin.Context) {
+	resp := response.New(c)
+
+	db := models.PostgresNew()
+	defer db.Close()
+
+	var req updateMenuSettingsRequest
+	if err := c.ShouldBindJSON(&req); err != nil {
+		resp.Fail(http.StatusBadRequest, "資料格式錯誤").Send()
+		return
+	}
+	if len(req.Items) == 0 {
+		resp.Fail(http.StatusBadRequest, "無更新項目").Send()
+		return
+	}
+
+	// 一次撈出所有目標 row 與其父層，做嚴格驗證
+	ids := make([]int64, 0, len(req.Items))
+	for _, item := range req.Items {
+		if len(item.Name) == 0 || len(item.Name) > 100 {
+			resp.Fail(http.StatusBadRequest, "名稱長度需介於 1~100").Send()
+			return
+		}
+		ids = append(ids, item.ID)
+	}
+
+	var dbPerms []models.Permission
+	db.GetRead().Where("id IN ?", ids).Find(&dbPerms)
+	if len(dbPerms) != len(req.Items) {
+		resp.Fail(http.StatusBadRequest, "包含不存在的權限項目").Send()
+		return
+	}
+	// 僅可變更 kind=page 的選單項；func 類（如 edit-master-code、CRUD 葉子）一律拒絕
+	for _, p := range dbPerms {
+		if p.Kind != "page" {
+			resp.Fail(http.StatusBadRequest, "禁止變更非選單項目").Send()
+			return
+		}
+	}
+	dbById := map[int64]models.Permission{}
+	for _, p := range dbPerms {
+		dbById[p.ID] = p
+	}
+
+	// 驗證每筆都屬於第 1 層或第 2 層；且 parent_id 未變更
+	// 第 1 層：ParentId IS NULL
+	// 第 2 層：其 ParentId 對應的 Permission 自己的 ParentId 為 NULL
+	parentIds := map[int64]bool{}
+	for _, p := range dbPerms {
+		if p.ParentId != nil {
+			parentIds[*p.ParentId] = true
+		}
+	}
+	parentIdList := make([]int64, 0, len(parentIds))
+	for id := range parentIds {
+		parentIdList = append(parentIdList, id)
+	}
+	var parentRows []models.Permission
+	if len(parentIdList) > 0 {
+		db.GetRead().Where("id IN ?", parentIdList).Find(&parentRows)
+	}
+	parentById := map[int64]models.Permission{}
+	for _, p := range parentRows {
+		parentById[p.ID] = p
+	}
+
+	for _, item := range req.Items {
+		dbRow := dbById[item.ID]
+
+		// parent_id 不可變更
+		reqParent := item.ParentId
+		dbParent := dbRow.ParentId
+		if (reqParent == nil) != (dbParent == nil) ||
+			(reqParent != nil && dbParent != nil && *reqParent != *dbParent) {
+			resp.Fail(http.StatusBadRequest, "禁止變更父層歸屬").Send()
+			return
+		}
+
+		// 必須為第 1 層或第 2 層
+		if dbRow.ParentId == nil {
+			// 第 1 層 OK
+			continue
+		}
+		parent, ok := parentById[*dbRow.ParentId]
+		if !ok || parent.ParentId != nil {
+			// 父層不在或父層自己又有父 → 表示該 row 是第 3 層或更深
+			resp.Fail(http.StatusBadRequest, "僅可更新第 1、2 層選單").Send()
+			return
+		}
+	}
+
+	// 通過驗證，逐筆更新（包在交易內）
+	err := db.GetWrite().Transaction(func(tx *gorm.DB) error {
+		for _, item := range req.Items {
+			if err := tx.Model(&models.Permission{}).
+				Where("id = ?", item.ID).
+				Updates(map[string]interface{}{
+					"name":          item.Name,
+					"sort":          item.Sort,
+					"is_customized": true,
+				}).Error; err != nil {
+				return err
+			}
+		}
+		return nil
+	})
+	if err != nil {
+		resp.Panic(err).Send()
+		return
+	}
+
+	resp.Success("更新成功").Send()
+}
+
+// createRoleRequest 新增角色請求
+type createRoleRequest struct {
+	Name string `json:"name" binding:"required"`
+}
+
+// CreateRole 新增角色
+func CreateRole(c *gin.Context) {
+	resp := response.New(c)
+
+	db := models.PostgresNew()
+	defer db.Close()
+
+	var req createRoleRequest
+	if err := c.ShouldBindJSON(&req); err != nil {
+		resp.Fail(http.StatusBadRequest, "請輸入角色名稱").Send()
+		return
+	}
+
+	// 檢查名稱不重複
+	var count int64
+	db.GetRead().Model(&models.Role{}).Where("name = ?", req.Name).Count(&count)
+	if count > 0 {
+		resp.Fail(http.StatusBadRequest, "角色名稱已存在").Send()
+		return
+	}
+
+	role := models.Role{Name: req.Name}
+	if err := db.GetWrite().Create(&role).Error; err != nil {
+		resp.Panic(err).Send()
+		return
+	}
+
+	resp.Success("新增成功").SetData(role).Send()
+}
+
+// updateRoleRequest 修改角色請求
+type updateRoleRequest struct {
+	Name string `json:"name" binding:"required"`
+}
+
+// UpdateRole 修改角色
+func UpdateRole(c *gin.Context) {
+	resp := response.New(c)
+
+	db := models.PostgresNew()
+	defer db.Close()
+
+	id, err := strconv.ParseInt(c.Param("id"), 10, 64)
+	if err != nil {
+		resp.Fail(http.StatusBadRequest, "無效的 ID").Send()
+		return
+	}
+
+	var req updateRoleRequest
+	if err := c.ShouldBindJSON(&req); err != nil {
+		resp.Fail(http.StatusBadRequest, "請輸入角色名稱").Send()
+		return
+	}
+
+	var role models.Role
+	if err := db.GetRead().Where("id = ?", id).First(&role).Error; err != nil {
+		resp.Fail(http.StatusBadRequest, "角色不存在").Send()
+		return
+	}
+
+	// 檢查名稱不重複（排除自己）
+	var count int64
+	db.GetRead().Model(&models.Role{}).Where("name = ? AND id != ?", req.Name, id).Count(&count)
+	if count > 0 {
+		resp.Fail(http.StatusBadRequest, "角色名稱已存在").Send()
+		return
+	}
+
+	db.GetWrite().Model(&role).Update("name", req.Name)
+	resp.Success("更新成功").Send()
+}
+
+// DeleteRole 刪除角色
+func DeleteRole(c *gin.Context) {
+	resp := response.New(c)
+
+	db := models.PostgresNew()
+	defer db.Close()
+
+	id, err := strconv.ParseInt(c.Param("id"), 10, 64)
+	if err != nil {
+		resp.Fail(http.StatusBadRequest, "無效的 ID").Send()
+		return
+	}
+
+	// 檢查是否有帳號使用此角色
+	var adminCount int64
+	db.GetRead().Model(&models.AdminRole{}).Where("role_id = ?", id).Count(&adminCount)
+	if adminCount > 0 {
+		resp.Fail(http.StatusBadRequest, "該角色仍有帳號使用中，無法刪除").Send()
+		return
+	}
+
+	// 刪除角色權限關聯 + 角色
+	db.GetWrite().Where("role_id = ?", id).Delete(&models.RolePermission{})
+	db.GetWrite().Where("id = ?", id).Delete(&models.Role{})
+
+	resp.Success("刪除成功").Send()
+}
+
+// GetRolePermissions 取得角色的權限 ID 列表
+func GetRolePermissions(c *gin.Context) {
+	resp := response.New(c)
+
+	db := models.PostgresNew()
+	defer db.Close()
+
+	id, err := strconv.ParseInt(c.Param("id"), 10, 64)
+	if err != nil {
+		resp.Fail(http.StatusBadRequest, "無效的 ID").Send()
+		return
+	}
+
+	var rolePermissions []models.RolePermission
+	db.GetRead().Where("role_id = ?", id).Find(&rolePermissions)
+
+	permissionIds := make([]int64, len(rolePermissions))
+	for i, rp := range rolePermissions {
+		permissionIds[i] = rp.PermissionId
+	}
+
+	resp.Success("成功").SetData(permissionIds).Send()
+}
+
+// updateRolePermissionsRequest 更新角色權限請求
+type updateRolePermissionsRequest struct {
+	PermissionIds []int64 `json:"permission_ids"`
+}
+
+// UpdateRolePermissions 更新角色的權限配置（全量替換）
+func UpdateRolePermissions(c *gin.Context) {
+	resp := response.New(c)
+
+	db := models.PostgresNew()
+	defer db.Close()
+
+	id, err := strconv.ParseInt(c.Param("id"), 10, 64)
+	if err != nil {
+		resp.Fail(http.StatusBadRequest, "無效的 ID").Send()
+		return
+	}
+
+	var req updateRolePermissionsRequest
+	if err := c.ShouldBindJSON(&req); err != nil {
+		resp.Fail(http.StatusBadRequest, "資料格式錯誤").Send()
+		return
+	}
+
+	// Transaction: 先刪後批次寫入 (原本 N 次獨立 INSERT 在權限多時 RTT 累積到秒級)
+	err = db.GetWrite().Transaction(func(tx *gorm.DB) error {
+		if err := tx.Where("role_id = ?", id).Delete(&models.RolePermission{}).Error; err != nil {
+			return err
+		}
+		if len(req.PermissionIds) == 0 {
+			return nil
+		}
+		rps := make([]models.RolePermission, 0, len(req.PermissionIds))
+		for _, pid := range req.PermissionIds {
+			rps = append(rps, models.RolePermission{RoleId: id, PermissionId: pid})
+		}
+		return tx.CreateInBatches(rps, 500).Error
+	})
+
+	if err != nil {
+		resp.Panic(err).Send()
+		return
+	}
+
+	resp.Success("權限設定成功").Send()
+}
